@@ -136,6 +136,27 @@ UNIT_ID      = int(os.getenv("MODBUS_UNIT_ID", "1"))
 # Reduce to 200 ms for faster transient response in lab exercises.
 SIM_DT_MS    = int(os.getenv("SIM_DT_MS", "1000"))
 
+# ── Determinism  (evaluation-harness support) ─────────────────────────────────
+# The physics models below add pseudo-random instrument noise to their sensor
+# outputs. For classroom use a fresh noise stream every run is desirable — no
+# two lab sessions look identical. Automated evaluation needs the opposite
+# guarantee: an identical sequence of control actions must produce an identical
+# process trajectory on every machine, or scores cannot be compared or replayed.
+#
+# SIM_SEED pins that stream. When it is unset we still draw a seed and log it,
+# so a run can be replayed afterwards by passing the logged value back in —
+# there is no such thing here as an unreproducible run.
+#
+# The stream is a private random.Random instance rather than the module-level
+# random.* functions on purpose. The global RNG is shared with every library in
+# the process (pymodbus, asyncio helpers, anything imported later), so an
+# unrelated dependency drawing from it would silently shift our noise sequence.
+# A private instance depends only on SIM_SEED and on our own call order.
+_SEED_ENV = os.getenv("SIM_SEED")
+SIM_SEED  = (int(_SEED_ENV) if _SEED_ENV not in (None, "")
+             else random.SystemRandom().getrandbits(63))
+RNG       = random.Random(SIM_SEED)
+
 # Water tank parameters
 TANK_VOLUME_L      = float(os.getenv("TANK_VOLUME_L",      "1000.0"))  # capacity, liters
 TANK_AREA_M2       = float(os.getenv("TANK_AREA_M2",       "1.0"))     # cross-section, m²
@@ -435,11 +456,11 @@ def update_water_tank(state: PhysicsState, coils: list[bool],
 
     # ── Inlet flow: valve position × max rated flow ──────────────────────────
     q_in = inlet_frac * VALVE_FLOW_MAX_LPM if inlet_cmd else 0.0
-    q_in = max(0.0, q_in + random.gauss(0.0, VALVE_FLOW_MAX_LPM * 0.001))
+    q_in = max(0.0, q_in + RNG.gauss(0.0, VALVE_FLOW_MAX_LPM * 0.001))
 
     # ── Outlet flow: VFD-controlled pump ─────────────────────────────────────
     q_out_pump = pump_frac * PUMP_FLOW_MAX_LPM if pump_cmd else 0.0
-    q_out_pump = max(0.0, q_out_pump + random.gauss(0.0, PUMP_FLOW_MAX_LPM * 0.001))
+    q_out_pump = max(0.0, q_out_pump + RNG.gauss(0.0, PUMP_FLOW_MAX_LPM * 0.001))
 
     # ── Gravity drain via bypass outlet valve (Torricelli model) ─────────────
     level_m = state.volume_l / (TANK_AREA_M2 * 1000.0)
@@ -681,7 +702,7 @@ def update_generator(state: PhysicsState, coils: list[bool],
     state.power_mw  = max(0.0, min(GEN_RATED_MW * 1.1, state.power_mw))
 
     # ── Load disturbance: random walk simulating consumer demand ─────────────
-    demand_noise = random.gauss(0.0, GEN_RATED_MW * 0.003)
+    demand_noise = RNG.gauss(0.0, GEN_RATED_MW * 0.003)
     p_load = state.power_mw + demand_noise
 
     # ── Swing equation: frequency deviation ──────────────────────────────────
@@ -732,14 +753,14 @@ def update_generic(state: PhysicsState, dt: float) -> None:
     sig_level    = 50.0 + 40.0 * math.sin(2 * math.pi * t / 120.0)
     sig_flow_in  = 50.0 + 30.0 * math.sin(2 * math.pi * t / 60.0)
     sig_flow_out = 50.0 + 20.0 * math.sin(2 * math.pi * t / 30.0)
-    sig_pressure = (t % 300.0) / 300.0 * 100.0 + random.gauss(0.0, 0.5)
+    sig_pressure = (t % 300.0) / 300.0 * 100.0 + RNG.gauss(0.0, 0.5)
 
     # Map normalized [0–100] signals to engineering units
     state.level_m      = sig_level    / 100.0 * 100.0    # 0–100 m
     state.flow_in_lpm  = sig_flow_in  / 100.0 * VALVE_FLOW_MAX_LPM
     state.flow_out_lpm = sig_flow_out / 100.0 * PUMP_FLOW_MAX_LPM
     state.pressure_bar = sig_pressure / 100.0 * 10.0     # 0–10 bar
-    state.temperature_c = 20.0 + random.gauss(0.0, 0.2)
+    state.temperature_c = 20.0 + RNG.gauss(0.0, 0.2)
 
     # Volume for status/alarm evaluation (signal-level based)
     state.volume_l = sig_level / 100.0 * TANK_VOLUME_L
@@ -838,6 +859,12 @@ async def main() -> None:
     log.info(
         "ICS Process Simulator — Device=%s  process=%s  unit=%d  port=%d  dt=%d ms",
         DEVICE_ID, PROCESS_TYPE, UNIT_ID, MODBUS_PORT, SIM_DT_MS,
+    )
+    # Logged unconditionally, including when the seed was drawn rather than
+    # supplied: this line is what makes any past run replayable.
+    log.info(
+        "Noise stream seed: SIM_SEED=%d  (%s — set SIM_SEED to this value to replay)",
+        SIM_SEED, "supplied" if _SEED_ENV not in (None, "") else "auto-generated",
     )
 
     # Build initial state to populate the datastore before the first physics tick
