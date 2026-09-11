@@ -17,11 +17,15 @@ COPY entrypoint.sh .
 RUN chmod +x entrypoint.sh
 
 # ── Default environment variables (all overridable by Docker Compose) ─────────
+# SIM_SEED is deliberately absent: leaving it unset makes the simulator draw a
+# random noise seed and log it, so lab runs stay varied but remain replayable.
+# Set it explicitly to reproduce a specific run.
 ENV DEVICE_ID=process-1 \
     PROCESS_TYPE=water-tank \
     MODBUS_PORT=502 \
     MODBUS_UNIT_ID=1 \
     SIM_DT_MS=1000 \
+    SIM_REALTIME=1 \
     TANK_VOLUME_L=1000.0 \
     TANK_AREA_M2=1.0 \
     PUMP_FLOW_MAX_LPM=150.0 \

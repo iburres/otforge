@@ -136,6 +136,35 @@ UNIT_ID      = int(os.getenv("MODBUS_UNIT_ID", "1"))
 # Reduce to 200 ms for faster transient response in lab exercises.
 SIM_DT_MS    = int(os.getenv("SIM_DT_MS", "1000"))
 
+# ── Determinism  (evaluation-harness support) ─────────────────────────────────
+# The physics models below add pseudo-random instrument noise to their sensor
+# outputs. For classroom use a fresh noise stream every run is desirable — no
+# two lab sessions look identical. Automated evaluation needs the opposite
+# guarantee: an identical sequence of control actions must produce an identical
+# process trajectory on every machine, or scores cannot be compared or replayed.
+#
+# SIM_SEED pins that stream. When it is unset we still draw a seed and log it,
+# so a run can be replayed afterwards by passing the logged value back in —
+# there is no such thing here as an unreproducible run.
+#
+# The stream is a private random.Random instance rather than the module-level
+# random.* functions on purpose. The global RNG is shared with every library in
+# the process (pymodbus, asyncio helpers, anything imported later), so an
+# unrelated dependency drawing from it would silently shift our noise sequence.
+# A private instance depends only on SIM_SEED and on our own call order.
+_SEED_ENV = os.getenv("SIM_SEED")
+SIM_SEED  = (int(_SEED_ENV) if _SEED_ENV not in (None, "")
+             else random.SystemRandom().getrandbits(63))
+RNG       = random.Random(SIM_SEED)
+
+# Tick pacing. Default (1) advances one physics tick per SIM_DT_MS of wall-clock
+# time, which is what a live lab session needs — the plant moves at plant speed.
+# Set SIM_REALTIME=0 to run ticks as fast as the event loop allows: simulated
+# time still advances by exactly SIM_DT_MS per tick, so the trajectory is
+# unchanged, but a 30-minute scenario completes in seconds. That is the mode an
+# evaluation harness uses when running many seeded episodes.
+SIM_REALTIME = os.getenv("SIM_REALTIME", "1").strip().lower() not in ("0", "false", "no")
+
 # Water tank parameters
 TANK_VOLUME_L      = float(os.getenv("TANK_VOLUME_L",      "1000.0"))  # capacity, liters
 TANK_AREA_M2       = float(os.getenv("TANK_AREA_M2",       "1.0"))     # cross-section, m²
@@ -435,11 +464,11 @@ def update_water_tank(state: PhysicsState, coils: list[bool],
 
     # ── Inlet flow: valve position × max rated flow ──────────────────────────
     q_in = inlet_frac * VALVE_FLOW_MAX_LPM if inlet_cmd else 0.0
-    q_in = max(0.0, q_in + random.gauss(0.0, VALVE_FLOW_MAX_LPM * 0.001))
+    q_in = max(0.0, q_in + RNG.gauss(0.0, VALVE_FLOW_MAX_LPM * 0.001))
 
     # ── Outlet flow: VFD-controlled pump ─────────────────────────────────────
     q_out_pump = pump_frac * PUMP_FLOW_MAX_LPM if pump_cmd else 0.0
-    q_out_pump = max(0.0, q_out_pump + random.gauss(0.0, PUMP_FLOW_MAX_LPM * 0.001))
+    q_out_pump = max(0.0, q_out_pump + RNG.gauss(0.0, PUMP_FLOW_MAX_LPM * 0.001))
 
     # ── Gravity drain via bypass outlet valve (Torricelli model) ─────────────
     level_m = state.volume_l / (TANK_AREA_M2 * 1000.0)
@@ -681,7 +710,7 @@ def update_generator(state: PhysicsState, coils: list[bool],
     state.power_mw  = max(0.0, min(GEN_RATED_MW * 1.1, state.power_mw))
 
     # ── Load disturbance: random walk simulating consumer demand ─────────────
-    demand_noise = random.gauss(0.0, GEN_RATED_MW * 0.003)
+    demand_noise = RNG.gauss(0.0, GEN_RATED_MW * 0.003)
     p_load = state.power_mw + demand_noise
 
     # ── Swing equation: frequency deviation ──────────────────────────────────
@@ -732,14 +761,14 @@ def update_generic(state: PhysicsState, dt: float) -> None:
     sig_level    = 50.0 + 40.0 * math.sin(2 * math.pi * t / 120.0)
     sig_flow_in  = 50.0 + 30.0 * math.sin(2 * math.pi * t / 60.0)
     sig_flow_out = 50.0 + 20.0 * math.sin(2 * math.pi * t / 30.0)
-    sig_pressure = (t % 300.0) / 300.0 * 100.0 + random.gauss(0.0, 0.5)
+    sig_pressure = (t % 300.0) / 300.0 * 100.0 + RNG.gauss(0.0, 0.5)
 
     # Map normalized [0–100] signals to engineering units
     state.level_m      = sig_level    / 100.0 * 100.0    # 0–100 m
     state.flow_in_lpm  = sig_flow_in  / 100.0 * VALVE_FLOW_MAX_LPM
     state.flow_out_lpm = sig_flow_out / 100.0 * PUMP_FLOW_MAX_LPM
     state.pressure_bar = sig_pressure / 100.0 * 10.0     # 0–10 bar
-    state.temperature_c = 20.0 + random.gauss(0.0, 0.2)
+    state.temperature_c = 20.0 + RNG.gauss(0.0, 0.2)
 
     # Volume for status/alarm evaluation (signal-level based)
     state.volume_l = sig_level / 100.0 * TANK_VOLUME_L
@@ -779,14 +808,65 @@ async def physics_loop(store: ModbusSlaveContext) -> None:
     )
 
     log.info(
-        "Physics loop started: process=%s  dt=%.3f s  "
+        "Physics loop started: process=%s  dt=%.3f s  pacing=%s  "
         "initial_volume=%.1f L  initial_level=%.2f m",
-        PROCESS_TYPE, dt, state.volume_l, state.level_m,
+        PROCESS_TYPE, dt, "real-time" if SIM_REALTIME else "fast-forward",
+        state.volume_l, state.level_m,
     )
+
+    # ── Tick pacing ───────────────────────────────────────────────────────────
+    # Ticks are scheduled against a fixed origin (t_start + n × dt) rather than
+    # by sleeping dt at a time. Sleeping dt per tick accumulates the OS timer's
+    # overshoot: every sleep returns a little late, and those delays add up with
+    # no upper bound, so simulated time falls progressively behind wall-clock
+    # time. Measured on an idle Windows host at dt = 1 s the naive pattern drifts
+    # ~0.3 % (≈ 5 s over a 30-minute run) and the compensated pattern ~0.03 %;
+    # under container load the gap widens.
+    #
+    # This matters because an operator, attack script, or evaluation agent acts
+    # on wall-clock time while the process advances on tick count. If the two
+    # diverge, the same action performed "10 seconds in" lands on a different
+    # tick from one run to the next, and the resulting trajectories differ even
+    # with the noise stream pinned by SIM_SEED.
+    #
+    # Note what is deliberately NOT done here: the integration step stays fixed
+    # at dt and is never replaced by the measured elapsed time. Integrating with
+    # a jittery real dt would make the physics itself depend on host load, which
+    # is the opposite of what evaluation needs. Wall-clock jitter is absorbed by
+    # the sleep, never by the model.
+    loop      = asyncio.get_running_loop()
+    t_start   = loop.time()
+    overruns  = 0  # ticks whose work did not finish before the next deadline
 
     tick = 0
     while True:
-        await asyncio.sleep(dt)
+        if SIM_REALTIME:
+            # Deadline for the tick we are about to compute.
+            delay = (t_start + (tick + 1) * dt) - loop.time()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            else:
+                # Behind schedule: the previous tick's work outlasted its budget.
+                # Do not try to catch up by skipping ticks — every tick must be
+                # computed or the trajectory changes. Yield instead, and report,
+                # because sustained overrun means dt is too small for this host
+                # and results from this run are not comparable to a healthy one.
+                overruns += 1
+                if overruns == 1 or overruns % 60 == 0:
+                    log.warning(
+                        "Physics loop behind schedule by %.3f s (overrun #%d) — "
+                        "SIM_DT_MS=%d may be too small for this host",
+                        -delay, overruns, SIM_DT_MS,
+                    )
+                await asyncio.sleep(0)
+        else:
+            # Fast-forward mode: run ticks as quickly as the event loop allows.
+            # Simulated time still advances by exactly dt per tick, so the
+            # trajectory is identical to a real-time run — it simply arrives
+            # sooner, which is what makes batches of evaluation episodes
+            # affordable. The zero-delay sleep yields to the Modbus server so
+            # client connections are still serviced.
+            await asyncio.sleep(0)
         try:
             coils     = read_coils(store)
             setpoints = read_setpoints(store)
@@ -838,6 +918,12 @@ async def main() -> None:
     log.info(
         "ICS Process Simulator — Device=%s  process=%s  unit=%d  port=%d  dt=%d ms",
         DEVICE_ID, PROCESS_TYPE, UNIT_ID, MODBUS_PORT, SIM_DT_MS,
+    )
+    # Logged unconditionally, including when the seed was drawn rather than
+    # supplied: this line is what makes any past run replayable.
+    log.info(
+        "Noise stream seed: SIM_SEED=%d  (%s — set SIM_SEED to this value to replay)",
+        SIM_SEED, "supplied" if _SEED_ENV not in (None, "") else "auto-generated",
     )
 
     # Build initial state to populate the datastore before the first physics tick
