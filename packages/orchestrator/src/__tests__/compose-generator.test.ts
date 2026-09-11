@@ -1620,6 +1620,80 @@ describe('process unit environment variable injection', () => {
     expect(env.some(v => v.startsWith('PIPELINE_'))).toBe(false)
     expect(env.some(v => v.startsWith('GENERATOR_'))).toBe(false)
   })
+
+  // Reproducibility controls: an evaluation scenario pins them, a teaching
+  // scenario leaves them out so the container keeps its own defaults (an unset
+  // SIM_SEED means the simulator draws and logs its own seed).
+  it('injects SIM_SEED and SIM_REALTIME=0 for a pinned fast-forward unit', () => {
+    const compose = gen(
+      makeScenario([
+        [
+          'tank-1',
+          {
+            category: 'process-unit',
+            ipAddress: '10.200.10.20',
+            processUnit: { processType: 'water-tank', simSeed: 42, simRealtime: false }
+          }
+        ]
+      ])
+    )
+    const env = compose.services['tank-1'].environment ?? []
+    expect(env).toContain('SIM_SEED=42')
+    expect(env).toContain('SIM_REALTIME=0')
+  })
+
+  it('emits SIM_REALTIME=1 when real-time pacing is set explicitly', () => {
+    const compose = gen(
+      makeScenario([
+        [
+          'tank-1',
+          {
+            category: 'process-unit',
+            ipAddress: '10.200.10.20',
+            processUnit: { processType: 'water-tank', simRealtime: true }
+          }
+        ]
+      ])
+    )
+    const env = compose.services['tank-1'].environment ?? []
+    expect(env).toContain('SIM_REALTIME=1')
+  })
+
+  // seed 0 is falsy but a perfectly valid seed -- it must survive the emit.
+  it('injects SIM_SEED=0 rather than dropping it as falsy', () => {
+    const compose = gen(
+      makeScenario([
+        [
+          'tank-1',
+          {
+            category: 'process-unit',
+            ipAddress: '10.200.10.20',
+            processUnit: { processType: 'water-tank', simSeed: 0 }
+          }
+        ]
+      ])
+    )
+    const env = compose.services['tank-1'].environment ?? []
+    expect(env).toContain('SIM_SEED=0')
+  })
+
+  it('omits SIM_SEED and SIM_REALTIME when not set', () => {
+    const compose = gen(
+      makeScenario([
+        [
+          'tank-1',
+          {
+            category: 'process-unit',
+            ipAddress: '10.200.10.20',
+            processUnit: { processType: 'water-tank' }
+          }
+        ]
+      ])
+    )
+    const env = compose.services['tank-1'].environment ?? []
+    expect(env.some(v => v.startsWith('SIM_SEED'))).toBe(false)
+    expect(env.some(v => v.startsWith('SIM_REALTIME'))).toBe(false)
+  })
 })
 
 // ── S7 / IEC 104 / BACnet env vars ───────────────────────────────────────────
