@@ -446,6 +446,31 @@ export interface ProcessUnitConfig {
   /** Simulation timestep in milliseconds (default 1000). Lower = faster transients. */
   simDtMs?: number
 
+  // ── Reproducibility controls ────────────────────────────────────────────
+  // These two exist for automated evaluation, where a recorded control sequence
+  // must replay to the same trajectory. Both are omitted from ordinary teaching
+  // scenarios, which want run-to-run variety and wall-clock pacing.
+  /**
+   * Seed for the instrument-noise RNG. Pinning it makes an identical control
+   * sequence reproduce the same process trajectory on any host.
+   *
+   * When omitted the container draws a seed itself and logs it at startup, so a
+   * classroom run stays varied but can still be replayed after the fact by
+   * setting this field to the seed that run logged.
+   */
+  simSeed?: number
+  /**
+   * Real-time pacing (default true). When false the simulator advances ticks as
+   * fast as the event loop allows while simulated time still moves by exactly
+   * simDtMs per tick — the trajectory is identical, it just arrives sooner,
+   * which makes batches of evaluation episodes affordable.
+   *
+   * Not suitable for a scenario a student watches: a fast-forwarded process
+   * cannot be observed by polling, since a client samples only a sparse scatter
+   * of ticks.
+   */
+  simRealtime?: boolean
+
   // ── Water tank parameters ──────────────────────────────────────────────────
   /** Total tank capacity in liters (default 1000). */
   tankVolumeL?: number

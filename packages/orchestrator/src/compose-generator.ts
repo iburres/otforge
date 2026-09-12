@@ -1983,6 +1983,13 @@ function buildDeviceEnv(
     const pu = device.processUnit
     env.push(`PROCESS_TYPE=${pu.processType}`)
     if (pu.simDtMs !== undefined) env.push(`SIM_DT_MS=${pu.simDtMs}`)
+    // Reproducibility controls. Both are left unset for ordinary teaching
+    // scenarios so the container keeps its defaults: an unset SIM_SEED makes the
+    // simulator draw (and log) its own seed, and SIM_REALTIME defaults to 1.
+    // SIM_REALTIME is emitted as 1/0 rather than true/false because sim.py reads
+    // it as a string and treats "0"/"false"/"no" as off.
+    if (pu.simSeed !== undefined) env.push(`SIM_SEED=${pu.simSeed}`)
+    if (pu.simRealtime !== undefined) env.push(`SIM_REALTIME=${pu.simRealtime ? 1 : 0}`)
     if (pu.tankVolumeL !== undefined) env.push(`TANK_VOLUME_L=${pu.tankVolumeL}`)
     if (pu.tankAreaM2 !== undefined) env.push(`TANK_AREA_M2=${pu.tankAreaM2}`)
     if (pu.pumpFlowMaxLpm !== undefined) env.push(`PUMP_FLOW_MAX_LPM=${pu.pumpFlowMaxLpm}`)
