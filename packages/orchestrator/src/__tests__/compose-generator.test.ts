@@ -1944,3 +1944,124 @@ describe('fixed infrastructure services', () => {
     expect(compose.services['zeek'].networks).toBeUndefined()
   })
 })
+
+// ── PLC ↔ process-unit wiring ─────────────────────────────────────────────────
+
+/**
+ * PROCESS_SIM_IP is what tells OpenPLC's Modbus-master engine which physics
+ * simulator to poll and drive. Without it the PLC comes up with no mbconfig.cfg,
+ * the simulator's coils stay at their zero-init, and the modeled process never
+ * responds to the controller — a silent failure that looks like a working lab.
+ *
+ * Two wiring styles must both resolve:
+ *   - a direct PLC↔process-unit edge, and
+ *   - a coilSource edge, where the controlling PLC is named inside
+ *     edge.data.coilSource and the edge itself is drawn through a visual-only
+ *     glyph (a pump/valve/sensor node with no entry in devices.devices).
+ *
+ * The coilSource style regressed: a both-endpoints-must-resolve guard ran before
+ * the coilSource branch and discarded every such edge.
+ */
+describe('PLC to process-unit wiring', () => {
+  /** Scenario with a PLC and a water tank, plus the edges the caller supplies. */
+  function wiringScenario(edges: OTForgeScenario['visual']['edges']): OTForgeScenario {
+    const sc = makeScenario([
+      ['plc-1', { category: 'plc', ipAddress: '10.200.10.10' }],
+      [
+        'process-unit-1',
+        {
+          category: 'process-unit',
+          ipAddress: '10.200.10.20',
+          processUnit: { processType: 'water-tank' }
+        }
+      ]
+    ])
+    sc.visual.edges = edges
+    return sc
+  }
+
+  /** Builds one canvas edge, optionally carrying a coilSource binding. */
+  function edge(
+    id: string,
+    source: string,
+    target: string,
+    coilSource?: { nodeId: string; coilIndex: number }
+  ): OTForgeScenario['visual']['edges'][number] {
+    return {
+      id,
+      source,
+      target,
+      data: { protocol: 'modbus-tcp', ...(coilSource && { coilSource }) }
+    }
+  }
+
+  /** Reads the PROCESS_SIM_IP value out of a generated PLC service, if present. */
+  function simIp(compose: ParsedCompose, service = 'plc-1'): string | undefined {
+    const env = compose.services[service]?.environment ?? []
+    return env.find(e => e.startsWith('PROCESS_SIM_IP='))?.split('=')[1]
+  }
+
+  it('wires a direct PLC to process-unit edge', () => {
+    const compose = gen(wiringScenario([edge('e1', 'plc-1', 'process-unit-1')]))
+    expect(simIp(compose)).toBe('10.200.10.20')
+  })
+
+  it('wires a direct edge drawn in the reverse direction', () => {
+    const compose = gen(wiringScenario([edge('e1', 'process-unit-1', 'plc-1')]))
+    expect(simIp(compose)).toBe('10.200.10.20')
+  })
+
+  it('wires a coilSource edge routed through a visual-only pump glyph', () => {
+    // inlet-pump-1 exists only on the canvas — it has no devices.devices entry.
+    // This is the exact shape ICS_Lab_01 uses, and the shape that regressed.
+    const compose = gen(
+      wiringScenario([
+        edge('e1', 'inlet-pump-1', 'process-unit-1', { nodeId: 'plc-1', coilIndex: 0 })
+      ])
+    )
+    expect(simIp(compose)).toBe('10.200.10.20')
+  })
+
+  it('wires a coilSource edge when the glyph is the target rather than the source', () => {
+    const compose = gen(
+      wiringScenario([
+        edge('e1', 'process-unit-1', 'outlet-valve-1', { nodeId: 'plc-1', coilIndex: 1 })
+      ])
+    )
+    expect(simIp(compose)).toBe('10.200.10.20')
+  })
+
+  it('ignores a coilSource edge naming a PLC that is not in the device map', () => {
+    const compose = gen(
+      wiringScenario([
+        edge('e1', 'inlet-pump-1', 'process-unit-1', { nodeId: 'ghost-plc', coilIndex: 0 })
+      ])
+    )
+    expect(simIp(compose)).toBeUndefined()
+  })
+
+  it('ignores a coilSource edge whose named source is not a controller', () => {
+    // Pointing coilSource at the tank itself must not inject PROCESS_SIM_IP
+    // into the process-unit's own container.
+    const compose = gen(
+      wiringScenario([
+        edge('e1', 'inlet-pump-1', 'process-unit-1', { nodeId: 'process-unit-1', coilIndex: 0 })
+      ])
+    )
+    expect(simIp(compose, 'process-unit-1')).toBeUndefined()
+  })
+
+  it('emits no PROCESS_SIM_IP when the PLC is not wired to any process-unit', () => {
+    const compose = gen(wiringScenario([]))
+    expect(simIp(compose)).toBeUndefined()
+  })
+
+  it('leaves an edge between two visual-only glyphs alone', () => {
+    const compose = gen(
+      wiringScenario([
+        edge('e1', 'inlet-pump-1', 'level-sensor-1', { nodeId: 'plc-1', coilIndex: 0 })
+      ])
+    )
+    expect(simIp(compose)).toBeUndefined()
+  })
+})
