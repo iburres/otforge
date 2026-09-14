@@ -246,9 +246,15 @@ otforge/
 │   ├── zeek/                 # Zeek network monitor
 │   └── firewall/             # nftables firewall
 ├── scenarios/                # Bundled .otflab scenario files
-│   ├── ICS_Lab_01.otflab                      # ICS Lab 01: Modbus Coil Write Attack
-│   ├── ICS_Lab_02.otflab                      # ICS Lab 02: ICS Protocol Survey
-│   └── tutorial-01-modbus-coil-write.otflab   # Tutorial 01 (guided overlay)
+│   ├── Learning_to_navigate_OTForge.otflab    # Guided tour of every major feature
+│   ├── OpenPLC_Lab.otflab                     # Ladder Diagram basics (IEC 61131-3)
+│   ├── ICS_Lab_01.otflab                      # Modbus coil write attack
+│   ├── ICS_Lab_02.otflab                      # ICS protocol survey
+│   ├── ICS_Lab_03.otflab                      # DNP3 IDS/IPS (oil & gas)
+│   ├── ICS_Lab_04.otflab                      # TRITON/TRISIS SIS compromise
+│   ├── IEC61850_Tutorial.otflab               # Substation MMS control
+│   ├── ISA88_Batch_Tutorial.otflab            # ISA-88 recipe tampering
+│   └── Building_Automation_Tutorial.otflab    # BACnet HVAC survey
 └── .github/
     └── workflows/            # CI: build, Docker image publish, CodeQL, secret scan
 ```
@@ -309,12 +315,31 @@ Install packs via **Toolbar → Packs → Install Pack** (Author mode). Installe
 
 ## Bundled Labs
 
-Two instructor-ready labs are included in the `scenarios/` folder and load directly from the OTForge canvas.
+Nine instructor-ready scenarios ship in the `scenarios/` folder and load directly from the OTForge canvas. Each includes a guided overlay with step-by-step instructions and success checks.
 
-| Lab | Scenario | Description |
+**Start here**
+
+| Scenario | File | Description |
 |---|---|---|
-| **ICS Lab 01** | `ICS_Lab_01.otflab` | Full ICS attack chain — OSINT recon against a fictitious industrial company website, DNS enumeration, network scanning, and a Modbus TCP coil write that closes an outlet valve and causes a water tank overflow. Includes a guided tutorial overlay with step-by-step instructions and success checks. |
-| **ICS Lab 02** | `ICS_Lab_02.otflab` | ICS protocol survey — students connect from the engineering workstation to each field device and read live process values using Modbus TCP, DNP3, OPC UA, and BACnet/IP. Prerequisite protocol literacy lab before the attack scenarios. |
+| **Learning to Navigate OTForge** | `Learning_to_navigate_OTForge.otflab` | Hands-on tour of every major feature. Starting from a single PLC and process unit, students build a complete multi-layer ICS scenario from scratch, exploring the full device palette, the PLC IDE, the firewall and IDS panels, and the monitoring stack. |
+| **OpenPLC Lab 01** | `OpenPLC_Lab.otflab` | IEC 61131-3 Ladder Diagram basics. Students write a one-rung LD program mapping a command coil to a pump output, compile it to Structured Text, and upload it to a live OpenPLC runtime. |
+
+**Protocol and attack labs**
+
+| Scenario | File | Description |
+|---|---|---|
+| **ICS Lab 01** — Modbus Coil Write Attack | `ICS_Lab_01.otflab` | Full ICS attack chain — OSINT recon against a fictitious industrial company website, DNS enumeration, network scanning, and a Modbus TCP coil write that closes an outlet valve and causes a water tank overflow. |
+| **ICS Lab 02** — ICS Protocol Survey | `ICS_Lab_02.otflab` | Students connect from the engineering workstation to each field device and read live process values using Modbus TCP, DNP3, OPC UA, and BACnet/IP. Protocol-literacy prerequisite for the attack scenarios. |
+| **ICS Lab 03** — IDS/IPS on an Oil & Gas SCADA Network | `ICS_Lab_03.otflab` | Students act as a network security engineer at a fictional gas pipeline operator, using Suricata and Zeek to detect an attacker issuing unauthorized DNP3 Direct Operate commands on the OT network. |
+| **ICS Lab 04** — TRITON/TRISIS Safety System Compromise | `ICS_Lab_04.otflab` | Modeled on the real 2017 TRITON/TRISIS incident against a Triconex Safety Instrumented System. A multi-stage chain through a petrochemical reactor unit, ending at the safety layer. |
+
+**Sector tutorials**
+
+| Scenario | File | Description |
+|---|---|---|
+| **IEC 61850 Tutorial** — Substation MMS Control | `IEC61850_Tutorial.otflab` | Feeder-bay substation automation. An attacker on the substation LAN sends an unauthorized MMS control command, and students work the resulting detection gap. |
+| **ISA-88 Batch Tutorial** — Recipe Tampering | `ISA88_Batch_Tutorial.otflab` | ISA-88 batch control and its most distinctive attack surface, a directly writable recipe-phase register. Students run a real five-phase batch to completion, then force-skip a phase. |
+| **Building Automation Tutorial** — BACnet HVAC Survey | `Building_Automation_Tutorial.otflab` | BACnet/IP building equipment — an air handling unit, two VAV boxes, a chiller, and a read-only zone sensor — read and operated from the engineering workstation. |
 
 Additional labs and scenario packs will be published in the [otforge-scenarios](https://github.com/iburres/otforge-scenarios) repository (coming soon).
 
