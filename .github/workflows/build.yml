@@ -80,6 +80,48 @@ jobs:
       - name: Run unit tests
         run: npm test
 
+  # ── Python unit tests ─────────────────────────────────────────────────────────
+  # Covers the Python that runs inside device containers, starting with the
+  # process simulator. Its determinism guarantees -- seeded replay, lock-step
+  # tick advancement, and the external/internal Modbus traffic split the settle
+  # barrier is built on -- are load-bearing and were previously verified only by
+  # hand against built images, so nothing caught a regression automatically.
+  python-test:
+    name: Python Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'   # matches the process-sim base image
+
+      - name: Install test dependencies
+        run: pip install -r containers/process-sim/requirements-dev.txt
+
+      - name: Verify pymodbus pin matches the shipped image
+        # The tests subclass ModbusSlaveContext, so they must run against the
+        # same pymodbus the container installs. Comparing the two pins here
+        # turns a silent drift into a build failure.
+        run: |
+          DOCKER_PIN=$(sed -n 's/.*pymodbus==\([0-9.]*\).*//p' containers/process-sim/Dockerfile | head -1)
+          DEV_PIN=$(sed -n 's/^pymodbus==\([0-9.]*\).*//p' containers/process-sim/requirements-dev.txt | head -1)
+          echo "Dockerfile: '$DOCKER_PIN'   requirements-dev: '$DEV_PIN'"
+          # An empty match on either side would compare equal and pass silently,
+          # so a missing pin is treated as failure rather than agreement.
+          if [ -z "$DOCKER_PIN" ] || [ -z "$DEV_PIN" ]; then
+            echo "::error::could not read a pymodbus pin from both files"
+            exit 1
+          fi
+          if [ "$DOCKER_PIN" != "$DEV_PIN" ]; then
+            echo "::error::pymodbus pin drift - Dockerfile has $DOCKER_PIN, requirements-dev.txt has $DEV_PIN"
+            exit 1
+          fi
+
+      - name: Run Python unit tests
+        run: pytest
+
   # ── Security scanning (runs in parallel with typecheck/lint/test) ─────────────
   # Three layers of static security analysis — none require a built app binary:
   #   1. npm audit  — known CVEs in npm dependencies (hard-fail on critical only)
@@ -154,7 +196,7 @@ jobs:
   # we spend runner time building installers.
   build:
     name: Build (${{ matrix.os }})
-    needs: [typecheck, lint, test]
+    needs: [typecheck, lint, test, python-test]
     strategy:
       fail-fast: false
       matrix:
