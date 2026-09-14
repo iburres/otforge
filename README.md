@@ -4,14 +4,16 @@
 [![Docker Images](https://github.com/iburres/otforge/actions/workflows/docker.yml/badge.svg)](https://github.com/iburres/otforge/actions/workflows/docker.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-A free, open-source ICS/SCADA cybersecurity training platform for researchers, educators, and students. Build realistic industrial control system environments on your laptop — no hardware, no subscription, no cost.
+A free, open-source ICS/SCADA cybersecurity platform for researchers, educators, and students. Build realistic industrial control system environments on your laptop — no hardware, no subscription, no cost.
+
+OTForge serves two purposes. It is a **hands-on training platform** for ICS/SCADA security education, and it is a **reproducible experimental environment** for AI safety research in critical infrastructure — a setting where an autonomous agent's actions have measurable physical consequences and where the same episode can be replayed exactly.
 
 Developed by **Ian Burres**, Professor of Practice at the University of Texas at San Antonio (UTSA), in support of ICS/SCADA security education and research.
 
 ---
 
-> ### 🆕 Milestone: Real Active Directory Support
-> OTForge now ships a genuine **Samba4 Active Directory Domain Controller** — real LDAP, real **Kerberos**, and real SMB, not a simulated stand-in. This closes the IT/Enterprise zone and completes coverage across every Purdue-model layer OTForge models, from field-level OT protocols up through enterprise identity infrastructure. Point real tools — `ldapsearch`, `kinit`, `smbclient`, `rpcclient`, impacket — at a live domain and get back genuine protocol responses. See [Protocol Support](#protocol-support) below.
+> ### 🆕 Milestone: Deterministic, Replayable Episodes
+> A scenario can now be pinned to a seed and replayed tick for tick. `simSeed` fixes the process simulator's noise stream, tick pacing schedules against a fixed origin instead of accumulating sleep drift, and `simRealtime: false` fast-forwards a run. Two seeded runs of the same lab produce byte-identical process trajectories — including closed-loop runs where a PLC is driving the physics. This is what lets OTForge serve as a scored, reproducible experimental environment rather than only a live training range. See [Research Use](#research-use--ai-safety-in-critical-infrastructure) below.
 
 ---
 
@@ -43,6 +45,8 @@ OTForge lets you design, deploy, and attack realistic ICS/SCADA environments usi
 **Attack the scenario** → launch the Kali Linux desktop (Wireshark, Metasploit, ICS-specific tools) in a dedicated OS window via KasmVNC and work through the mission.
 
 **Monitor and analyze** → live Grafana dashboards show Suricata IPS alerts and Zeek protocol logs alongside the InfluxDB process historian.
+
+**Replay the scenario** → pin a seed in the scenario file and the physics replay exactly, run after run, so a result can be reproduced or compared across runs on any host.
 
 ---
 
@@ -80,6 +84,35 @@ OTForge lets you design, deploy, and attack realistic ICS/SCADA environments usi
 - Zeek deep-packet analysis with ICS protocol scripts
 - Grafana dashboards for real-time alert visualization
 - InfluxDB 1.8 process historian
+
+---
+
+## Research Use — AI Safety in Critical Infrastructure
+
+Frontier models are increasingly capable of operating tools autonomously, and critical infrastructure is one of the settings where that capability carries the most consequence. Studying it seriously requires an environment where a model can actually act, where the effect of an action is physical rather than textual, and where the same episode can be run again and come out the same.
+
+Most cyber-physical testbeds that meet that bar are hardware-based, access-controlled, or both. OTForge is neither: it is public, it runs on a laptop, and it is reproducible by anyone who clones the repository.
+
+### What the environment provides
+
+- **Real protocol surfaces, not descriptions of them** — an agent acts by speaking Modbus, DNP3, OPC UA, S7comm, BACnet, or IEC 61850 to a live service, the same as any other client.
+- **Physical process state as ground truth** — a water tank, pipeline, generator, or batch reactor integrates real dynamics. Whether an action mattered is read off tank level, flow, pressure, or frequency rather than inferred from a transcript, which makes an unambiguous, machine-checkable grader.
+- **Closed-loop control** — a PLC running IEC 61131-3 logic polls the simulated process over a Modbus master link and drives it back, so the environment pushes back on an agent's actions the way a real plant does.
+- **Deterministic replay** — `simSeed` pins the noise stream and tick pacing is drift-free, so an identical scenario produces an identical trajectory. Verified byte-identical both standalone and closed-loop with a PLC in the loop.
+- **Full defensive telemetry** — Suricata, Zeek, and a process historian record every episode, so the offensive and defensive views of the same run are both available.
+- **Layered difficulty** — scenarios range from a single Modbus coil write to multi-stage chains involving OSINT, network pivoting, and safety-system manipulation.
+
+### Directions this supports
+
+- **Capability evaluation** — scoring how far an agent gets on tiered cyber-physical tasks, graded on process state rather than on self-report.
+- **Mechanistic interpretability** — a deterministic environment is a precondition for relating a model's internal computation to what it actually did. When an episode replays exactly, behavioral differences can be attributed to the model rather than to environment noise, and a specific physical outcome can be traced back to the decision that produced it.
+- **Defensive uplift** — measuring whether model assistance improves detection and response, using the same episodes and the same telemetry.
+
+### Status
+
+The environment and deterministic replay are implemented and verified. A **headless episode API with lock-step tick advancement** — so an external agent and the process clock advance together instead of the agent sampling a free-running simulation — is the next increment and is **not yet built**.
+
+Determinism is configured per process unit in the `.otflab` file (`simSeed`, `simRealtime`, `simDtMs`); these fields are not yet exposed in the properties panel, so scenario-file authoring is the path.
 
 ---
 
@@ -289,6 +322,19 @@ Additional labs and scenario packs will be published in the [otforge-scenarios](
 
 ## Recent Additions
 
+### Deterministic Process Simulation
+The process simulator can be pinned to a seed and replayed exactly, which is what turns a scenario into a repeatable experiment.
+
+- **`simSeed`** seeds a private noise RNG, so sensor noise is reproducible. The seed is always logged — an unseeded run prints the seed it drew, so any run stays replayable after the fact
+- **Drift-free tick pacing** — ticks are scheduled against a fixed origin instead of sleeping `dt` each cycle, cutting accumulated drift from 0.3% to 0.03%. Without this, an external action lands on a different tick each run
+- **`simRealtime: false`** fast-forwards a run as fast as the event loop allows, for offline analysis rather than live observation
+- Emission is opt-in, so scenarios without these fields generate byte-identical Compose output to before
+
+### Closed-Loop PLC ↔ Process Wiring Fix
+Edges that connect a PLC to a process unit *through* a visual-only glyph — a pump, valve, or sensor symbol drawn on the canvas — name the controlling PLC inside the edge rather than as an endpoint. The compose generator was discarding those edges before reading that binding, so affected scenarios never received `PROCESS_SIM_IP`, their OpenPLC started with no Modbus master configuration, and the simulated process never responded to its own controller.
+
+Now fixed and covered by tests: the PLC drives the process, the tank responds, and closed-loop runs replay deterministically.
+
 ### Real Active Directory Domain Controller
 The **domain-controller** device is now a genuine Samba4 Active Directory Domain Controller, not a stub — the first real implementation of enterprise identity infrastructure anywhere in OTForge.
 
@@ -338,6 +384,8 @@ All container images now build and run natively on Apple Silicon Macs (M1/M2/M3/
 | 13 | Guided tutorial system — TutorialPanel overlay, Tutorial 01 (Modbus Coil Write), DnsConfig schema | ✅ Complete |
 | — | Apple Silicon native ARM64 support — all container images multi-platform, OpenPLC native build | ✅ Complete |
 | 14 | macOS + Linux packaging and distribution | 🔜 Planned |
+| 15 | Deterministic process simulation (`simSeed`, drift-free tick pacing, `simRealtime` fast-forward) | ✅ Complete |
+| 16 | Headless episode API with lock-step tick advancement | 🔜 Planned |
 
 ---
 
