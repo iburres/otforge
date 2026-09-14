@@ -436,34 +436,42 @@ export function generateCompose(
   //
   // The map stores: plcNodeId → processUnitNodeId for later IP resolution.
   const plcToProcessUnitNodeId = new Map<string, string>()
+  const isController = (category: string): boolean =>
+    category === 'plc' || category === 'safety-plc' || category === 'batch-controller'
+
   for (const edge of scenario.visual.edges) {
     const srcDevice = scenario.devices.devices[edge.source]
     const tgtDevice = scenario.devices.devices[edge.target]
-    if (!srcDevice || !tgtDevice) continue
+
+    // coilSource-based: the controlling PLC is named INSIDE edge.data.coilSource
+    // rather than being an edge endpoint. That indirection exists precisely so a
+    // pipe can be drawn through visual-only glyphs — pump, valve and sensor nodes
+    // that live in visual.nodes but have no entry in devices.devices and so no
+    // container. Requiring both endpoints to resolve to real devices would throw
+    // away every such edge and with it the whole mechanism, so here only the
+    // process-unit endpoint has to resolve; the other may legitimately be a glyph.
     if (edge.data.coilSource) {
-      // coilSource-based: edge touches a process-unit and names the controlling PLC
-      if (tgtDevice.category === 'process-unit') {
-        plcToProcessUnitNodeId.set(edge.data.coilSource.nodeId, edge.target)
-      } else if (srcDevice.category === 'process-unit') {
-        plcToProcessUnitNodeId.set(edge.data.coilSource.nodeId, edge.source)
+      const plcNodeId = edge.data.coilSource.nodeId
+      const plcDevice = scenario.devices.devices[plcNodeId]
+      // The named coil source must itself be a real controller — a dangling or
+      // non-controller nodeId would otherwise inject PROCESS_SIM_IP into whatever
+      // container happened to share the id.
+      if (!plcDevice || !isController(plcDevice.category)) continue
+      if (tgtDevice?.category === 'process-unit') {
+        plcToProcessUnitNodeId.set(plcNodeId, edge.target)
+      } else if (srcDevice?.category === 'process-unit') {
+        plcToProcessUnitNodeId.set(plcNodeId, edge.source)
       }
-    } else {
-      // Direct edge fallback: one endpoint is PLC, other is process-unit
-      if (
-        (srcDevice.category === 'plc' ||
-          srcDevice.category === 'safety-plc' ||
-          srcDevice.category === 'batch-controller') &&
-        tgtDevice.category === 'process-unit'
-      ) {
-        plcToProcessUnitNodeId.set(edge.source, edge.target)
-      } else if (
-        srcDevice.category === 'process-unit' &&
-        (tgtDevice.category === 'plc' ||
-          tgtDevice.category === 'safety-plc' ||
-          tgtDevice.category === 'batch-controller')
-      ) {
-        plcToProcessUnitNodeId.set(edge.target, edge.source)
-      }
+      continue
+    }
+
+    // Direct edge fallback: both endpoints must be real devices, one a controller
+    // and the other the process-unit it drives.
+    if (!srcDevice || !tgtDevice) continue
+    if (isController(srcDevice.category) && tgtDevice.category === 'process-unit') {
+      plcToProcessUnitNodeId.set(edge.source, edge.target)
+    } else if (srcDevice.category === 'process-unit' && isController(tgtDevice.category)) {
+      plcToProcessUnitNodeId.set(edge.target, edge.source)
     }
   }
 
