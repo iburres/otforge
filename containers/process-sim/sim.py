@@ -190,6 +190,35 @@ SIM_STEPPED = os.getenv("SIM_STEPPED", "0").strip().lower() in ("1", "true", "ye
 # training scenario opens no extra port.
 SIM_CONTROL_PORT = int(os.getenv("SIM_CONTROL_PORT", "8600"))
 
+# ── Controller settle barrier ─────────────────────────────────────────────────
+# Stepping this simulator is not by itself enough to make a CLOSED-LOOP episode
+# reproducible. A PLC is a separate container running its own scan on wall-clock
+# time; it keeps polling and writing while this process is frozen between grants.
+# Whether a given PLC write lands before or after a step boundary is then a race,
+# which puts exactly the nondeterminism back that SIM_SEED removes.
+#
+# SIM_STEP_BARRIER=1 closes that race. Before granting ticks, /step waits for the
+# attached controller to complete one full scan against the currently published
+# state: first a PV read, then the coil write that answers it. The coils the next
+# tick integrates are therefore always the controller's considered response to the
+# state it actually saw, rather than whatever happened to be in the datastore when
+# the clock moved.
+#
+# This rests on a measured property of the OpenPLC Modbus master rather than on a
+# hard guarantee: it polls at its configured period (100 ms by default) and writes
+# its mapped coils every scan, unconditionally, not only when an output changes.
+# Measured 9.8 reads/s and 9.8 writes/s, exactly 1:1, against a frozen simulator.
+# If a controller is attached that only writes on change, the write wait will not
+# be satisfied and the barrier reports a timeout instead of silently pretending.
+#
+# Off by default: with no controller attached every step would wait out the full
+# timeout, so sim-only episodes should leave this alone.
+SIM_STEP_BARRIER = os.getenv("SIM_STEP_BARRIER", "0").strip().lower() in ("1", "true", "yes")
+
+# How long to wait for that scan before giving up and stepping anyway. The default
+# allows roughly twenty scans at the stock 100 ms polling period.
+SIM_BARRIER_TIMEOUT_MS = int(os.getenv("SIM_BARRIER_TIMEOUT_MS", "2000"))
+
 # Water tank parameters
 TANK_VOLUME_L      = float(os.getenv("TANK_VOLUME_L",      "1000.0"))  # capacity, liters
 TANK_AREA_M2       = float(os.getenv("TANK_AREA_M2",       "1.0"))     # cross-section, m²
@@ -295,6 +324,46 @@ class PhysicsState:
 
 # ── Modbus datastore helpers ───────────────────────────────────────────────────
 
+class CountingSlaveContext(ModbusSlaveContext):
+    """
+    Modbus datastore that counts accesses arriving from the wire.
+
+    A lock-step controller needs to know whether the PLC has seen the state it
+    just published and acted on it. The datastore is the only place both the
+    PLC's reads and its writes are observable, so the counters live here.
+
+    The counters must reflect external traffic only, which is possible because
+    the simulator's own accesses are cleanly separable by function code and
+    address window:
+
+      - write_pvs() writes with FC3/FC4, never FC5/FC15, so counting only coil
+        function codes excludes every internal write. Nothing internal ever
+        writes a coil.
+      - read_setpoints() reads FC3 at the setpoint window (HR 100+), while the
+        PLC polls the PV window (HR 0-9). Counting only reads below the setpoint
+        window therefore excludes the internal setpoint read.
+      - read_coils() reads FC1, which is not counted at all.
+
+    Get these windows wrong and the counters silently include the simulator's
+    own traffic, which would make a barrier built on them satisfy itself.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.pv_reads = 0     # external PV polls (FC3/FC4 below the setpoint window)
+        self.coil_writes = 0  # external coil writes (FC5/FC15)
+
+    def getValues(self, fc_as_hex, address, count=1):
+        if fc_as_hex in (3, 4) and address < HR_PUMP_SPEED_SP:
+            self.pv_reads += 1
+        return super().getValues(fc_as_hex, address, count)
+
+    def setValues(self, fc_as_hex, address, values):
+        if fc_as_hex in (5, 15):
+            self.coil_writes += 1
+        return super().setValues(fc_as_hex, address, values)
+
+
 def build_store(state: PhysicsState) -> ModbusSlaveContext:
     """
     Creates the pymodbus slave context (register datastore) with initial values.
@@ -325,7 +394,7 @@ def build_store(state: PhysicsState) -> ModbusSlaveContext:
     hr[HR_INLET_VALVE_SP] = 5000   # 50.00 %
     hr[HR_LEVEL_SP]       = _clamp(int(state.level_m * 100))
 
-    return ModbusSlaveContext(
+    return CountingSlaveContext(
         di=ModbusSequentialDataBlock(0, [0] * 256),  # discrete inputs — unused
         co=ModbusSequentialDataBlock(0, [0] * 256),  # coils — PLC writes control
         hr=ModbusSequentialDataBlock(0, list(hr)),   # holding registers
@@ -827,6 +896,7 @@ class EpisodeClock:
 
     def __init__(self) -> None:
         self.tick = 0                              # ticks computed since start
+        self.store: "CountingSlaveContext | None" = None  # for external-IO counters
         self.state: "PhysicsState | None" = None   # most recent published state
         self.status = 0                            # most recent STATUS_WORD
         self._budget = 0                           # ticks still owed to the caller
@@ -865,6 +935,10 @@ class EpisodeClock:
             "seed": SIM_SEED,
             "dt_ms": SIM_DT_MS,
             "state": {k: round(v, 6) for k, v in asdict(self.state).items()} if self.state else {},
+            "io": {
+                "pv_reads": self.store.pv_reads if self.store else 0,
+                "coil_writes": self.store.coil_writes if self.store else 0,
+            },
         }
 
 
@@ -925,6 +999,53 @@ async def _read_request(reader: asyncio.StreamReader) -> "tuple[str, str, dict]"
     return method, path, body
 
 
+async def _settle_barrier(clock: EpisodeClock) -> dict:
+    """
+    Waits for the attached controller to complete one full scan against the
+    currently published state, so the coils the next tick reads are its response
+    to the state it actually saw.
+
+    Waits for a PV read first and only then for a coil write. Waiting for a write
+    alone would be satisfied by a write already in flight from a scan that ran
+    against the PREVIOUS state, which is the race this exists to close.
+
+    Returns a report rather than raising on timeout. A step that proceeded without
+    the controller settling is still a valid step, but the caller needs to know the
+    episode has a gap in its determinism guarantee — silently continuing would hide
+    exactly the problem this is here to prevent.
+    """
+    if not SIM_STEP_BARRIER:
+        return {"mode": "disabled", "satisfied": None, "waited_ms": 0}
+    if clock.store is None:
+        return {"mode": "unavailable", "satisfied": False, "waited_ms": 0}
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    deadline = started + SIM_BARRIER_TIMEOUT_MS / 1000.0
+    poll = 0.005  # 5 ms; the simulator is idle here, so this costs nothing
+
+    def waited_ms() -> int:
+        return int((loop.time() - started) * 1000)
+
+    # Phase 1 — the controller reads the state published by the previous step.
+    reads0 = clock.store.pv_reads
+    while clock.store.pv_reads <= reads0:
+        if loop.time() >= deadline:
+            return {"mode": "read", "satisfied": False, "waited_ms": waited_ms(),
+                    "detail": "no PV read observed before timeout"}
+        await asyncio.sleep(poll)
+
+    # Phase 2 — the controller writes the coils answering that read.
+    writes0 = clock.store.coil_writes
+    while clock.store.coil_writes <= writes0:
+        if loop.time() >= deadline:
+            return {"mode": "write", "satisfied": False, "waited_ms": waited_ms(),
+                    "detail": "PV read seen but no coil write before timeout"}
+        await asyncio.sleep(poll)
+
+    return {"mode": "scan", "satisfied": True, "waited_ms": waited_ms()}
+
+
 def _make_control_handler(clock: EpisodeClock):
     """Builds the connection handler, closing over the shared EpisodeClock."""
 
@@ -942,6 +1063,8 @@ def _make_control_handler(clock: EpisodeClock):
                     "seed": SIM_SEED,
                     "process_type": PROCESS_TYPE,
                     "dt_ms": SIM_DT_MS,
+                    "barrier": SIM_STEP_BARRIER,
+                    "barrier_timeout_ms": SIM_BARRIER_TIMEOUT_MS,
                 })
 
             elif path == "/state" and method == "GET":
@@ -958,8 +1081,11 @@ def _make_control_handler(clock: EpisodeClock):
                         "got": repr(ticks),
                     })
                 else:
+                    barrier = await _settle_barrier(clock)
                     await clock.request(ticks)
-                    resp = _http_response(200, clock.snapshot())
+                    snap = clock.snapshot()
+                    snap["barrier"] = barrier
+                    resp = _http_response(200, snap)
 
             elif path in ("/health", "/state", "/step"):
                 resp = _http_response(405, {"error": "method not allowed",
@@ -1048,6 +1174,7 @@ async def physics_loop(store: ModbusSlaveContext, clock: EpisodeClock) -> None:
     tick = 0
     # Publish the starting state so a controller can read /state before the
     # first tick is granted and see the true initial conditions.
+    clock.store = store
     clock.state = state
     clock.status = _build_status(state, read_coils(store))
 
@@ -1177,8 +1304,10 @@ async def main() -> None:
         )
         log.info(
             "Lock-step mode: physics advances only on POST /step — "
-            "control API on port %d (GET /health, GET /state, POST /step)",
+            "control API on port %d (GET /health, GET /state, POST /step); "
+            "settle barrier %s",
             SIM_CONTROL_PORT,
+            ("on, timeout %d ms" % SIM_BARRIER_TIMEOUT_MS) if SIM_STEP_BARRIER else "off",
         )
         asyncio.ensure_future(control.serve_forever())
 
