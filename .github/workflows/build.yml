@@ -101,23 +101,12 @@ jobs:
         run: pip install -r containers/process-sim/requirements-dev.txt
 
       - name: Verify pymodbus pin matches the shipped image
-        # The tests subclass ModbusSlaveContext, so they must run against the
-        # same pymodbus the container installs. Comparing the two pins here
-        # turns a silent drift into a build failure.
-        run: |
-          DOCKER_PIN=$(sed -n 's/.*pymodbus==\([0-9.]*\).*//p' containers/process-sim/Dockerfile | head -1)
-          DEV_PIN=$(sed -n 's/^pymodbus==\([0-9.]*\).*//p' containers/process-sim/requirements-dev.txt | head -1)
-          echo "Dockerfile: '$DOCKER_PIN'   requirements-dev: '$DEV_PIN'"
-          # An empty match on either side would compare equal and pass silently,
-          # so a missing pin is treated as failure rather than agreement.
-          if [ -z "$DOCKER_PIN" ] || [ -z "$DEV_PIN" ]; then
-            echo "::error::could not read a pymodbus pin from both files"
-            exit 1
-          fi
-          if [ "$DOCKER_PIN" != "$DEV_PIN" ]; then
-            echo "::error::pymodbus pin drift - Dockerfile has $DOCKER_PIN, requirements-dev.txt has $DEV_PIN"
-            exit 1
-          fi
+        # The tests subclass ModbusSlaveContext, so they must run against
+        # the same pymodbus the container installs. A comment asking the
+        # next person to keep the two files in sync is not enforcement.
+        # Implemented as a script rather than inline shell so it needs no
+        # escaping in YAML and can be run locally exactly as CI runs it.
+        run: python scripts/check_pymodbus_pin.py
 
       - name: Run Python unit tests
         run: pytest
