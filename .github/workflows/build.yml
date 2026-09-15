@@ -80,6 +80,37 @@ jobs:
       - name: Run unit tests
         run: npm test
 
+  # ── Python unit tests ─────────────────────────────────────────────────────────
+  # Covers the Python that runs inside device containers, starting with the
+  # process simulator. Its determinism guarantees -- seeded replay, lock-step
+  # tick advancement, and the external/internal Modbus traffic split the settle
+  # barrier is built on -- are load-bearing and were previously verified only by
+  # hand against built images, so nothing caught a regression automatically.
+  python-test:
+    name: Python Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'   # matches the process-sim base image
+
+      - name: Install test dependencies
+        run: pip install -r containers/process-sim/requirements-dev.txt
+
+      - name: Verify pymodbus pin matches the shipped image
+        # The tests subclass ModbusSlaveContext, so they must run against
+        # the same pymodbus the container installs. A comment asking the
+        # next person to keep the two files in sync is not enforcement.
+        # Implemented as a script rather than inline shell so it needs no
+        # escaping in YAML and can be run locally exactly as CI runs it.
+        run: python scripts/check_pymodbus_pin.py
+
+      - name: Run Python unit tests
+        run: pytest
+
   # ── Security scanning (runs in parallel with typecheck/lint/test) ─────────────
   # Three layers of static security analysis — none require a built app binary:
   #   1. npm audit  — known CVEs in npm dependencies (hard-fail on critical only)
@@ -154,7 +185,7 @@ jobs:
   # we spend runner time building installers.
   build:
     name: Build (${{ matrix.os }})
-    needs: [typecheck, lint, test]
+    needs: [typecheck, lint, test, python-test]
     strategy:
       fail-fast: false
       matrix:

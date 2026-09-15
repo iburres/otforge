@@ -1,0 +1,12 @@
+# Test-time dependencies for the process simulator.
+#
+# pymodbus MUST stay pinned to the same version the Dockerfile installs. The
+# tests exercise real ModbusSlaveContext behaviour -- CountingSlaveContext
+# overrides getValues/setValues -- so testing against a different release would
+# verify an API the shipped image does not run. CI enforces this with an
+# explicit pin-match check rather than trusting the comment.
+pymodbus==3.7.4
+
+# The suite drives asyncio with asyncio.run() rather than pytest-asyncio, so
+# pytest itself is the only test framework dependency.
+pytest>=8,<10

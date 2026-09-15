@@ -107,11 +107,12 @@ References:
 """
 
 import asyncio
+import json
 import logging
 import math
 import os
 import random
-from dataclasses import dataclass, field as dc_field
+from dataclasses import asdict, dataclass, field as dc_field
 
 from pymodbus.datastore import (
     ModbusSequentialDataBlock,
@@ -164,6 +165,59 @@ RNG       = random.Random(SIM_SEED)
 # unchanged, but a 30-minute scenario completes in seconds. That is the mode an
 # evaluation harness uses when running many seeded episodes.
 SIM_REALTIME = os.getenv("SIM_REALTIME", "1").strip().lower() not in ("0", "false", "no")
+
+# ── Lock-step episode control ─────────────────────────────────────────────────
+# SIM_STEPPED=1 hands the simulation clock to an external controller. The physics
+# loop then computes no tick on its own: it blocks until a controller grants a
+# specific number of ticks over the control API, computes exactly that many, and
+# blocks again. POST /step does not return until those ticks are done and their
+# results are visible, so the controller and the process advance together instead
+# of the controller sampling a clock that is running underneath it.
+#
+# This is what a free-running simulation cannot give an evaluation harness. In
+# real-time mode a client that wants "the state 10 seconds in" samples whenever
+# its own scheduling lets it, and in fast-forward mode the process races ahead
+# between polls so the client sees a sparse, host-dependent scatter of ticks.
+# Neither is reproducible. Stepped mode removes wall-clock time from the loop
+# entirely: the trajectory depends only on SIM_SEED, the starting conditions,
+# and the sequence of actions, so the same episode replays exactly.
+#
+# SIM_STEPPED takes precedence over SIM_REALTIME, which is ignored while stepping.
+# Default off, so every existing scenario keeps its current behaviour.
+SIM_STEPPED = os.getenv("SIM_STEPPED", "0").strip().lower() in ("1", "true", "yes")
+
+# TCP port for the control API. Only bound when SIM_STEPPED is on, so a normal
+# training scenario opens no extra port.
+SIM_CONTROL_PORT = int(os.getenv("SIM_CONTROL_PORT", "8600"))
+
+# ── Controller settle barrier ─────────────────────────────────────────────────
+# Stepping this simulator is not by itself enough to make a CLOSED-LOOP episode
+# reproducible. A PLC is a separate container running its own scan on wall-clock
+# time; it keeps polling and writing while this process is frozen between grants.
+# Whether a given PLC write lands before or after a step boundary is then a race,
+# which puts exactly the nondeterminism back that SIM_SEED removes.
+#
+# SIM_STEP_BARRIER=1 closes that race. Before granting ticks, /step waits for the
+# attached controller to complete one full scan against the currently published
+# state: first a PV read, then the coil write that answers it. The coils the next
+# tick integrates are therefore always the controller's considered response to the
+# state it actually saw, rather than whatever happened to be in the datastore when
+# the clock moved.
+#
+# This rests on a measured property of the OpenPLC Modbus master rather than on a
+# hard guarantee: it polls at its configured period (100 ms by default) and writes
+# its mapped coils every scan, unconditionally, not only when an output changes.
+# Measured 9.8 reads/s and 9.8 writes/s, exactly 1:1, against a frozen simulator.
+# If a controller is attached that only writes on change, the write wait will not
+# be satisfied and the barrier reports a timeout instead of silently pretending.
+#
+# Off by default: with no controller attached every step would wait out the full
+# timeout, so sim-only episodes should leave this alone.
+SIM_STEP_BARRIER = os.getenv("SIM_STEP_BARRIER", "0").strip().lower() in ("1", "true", "yes")
+
+# How long to wait for that scan before giving up and stepping anyway. The default
+# allows roughly twenty scans at the stock 100 ms polling period.
+SIM_BARRIER_TIMEOUT_MS = int(os.getenv("SIM_BARRIER_TIMEOUT_MS", "2000"))
 
 # Water tank parameters
 TANK_VOLUME_L      = float(os.getenv("TANK_VOLUME_L",      "1000.0"))  # capacity, liters
@@ -270,6 +324,46 @@ class PhysicsState:
 
 # ── Modbus datastore helpers ───────────────────────────────────────────────────
 
+class CountingSlaveContext(ModbusSlaveContext):
+    """
+    Modbus datastore that counts accesses arriving from the wire.
+
+    A lock-step controller needs to know whether the PLC has seen the state it
+    just published and acted on it. The datastore is the only place both the
+    PLC's reads and its writes are observable, so the counters live here.
+
+    The counters must reflect external traffic only, which is possible because
+    the simulator's own accesses are cleanly separable by function code and
+    address window:
+
+      - write_pvs() writes with FC3/FC4, never FC5/FC15, so counting only coil
+        function codes excludes every internal write. Nothing internal ever
+        writes a coil.
+      - read_setpoints() reads FC3 at the setpoint window (HR 100+), while the
+        PLC polls the PV window (HR 0-9). Counting only reads below the setpoint
+        window therefore excludes the internal setpoint read.
+      - read_coils() reads FC1, which is not counted at all.
+
+    Get these windows wrong and the counters silently include the simulator's
+    own traffic, which would make a barrier built on them satisfy itself.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.pv_reads = 0     # external PV polls (FC3/FC4 below the setpoint window)
+        self.coil_writes = 0  # external coil writes (FC5/FC15)
+
+    def getValues(self, fc_as_hex, address, count=1):
+        if fc_as_hex in (3, 4) and address < HR_PUMP_SPEED_SP:
+            self.pv_reads += 1
+        return super().getValues(fc_as_hex, address, count)
+
+    def setValues(self, fc_as_hex, address, values):
+        if fc_as_hex in (5, 15):
+            self.coil_writes += 1
+        return super().setValues(fc_as_hex, address, values)
+
+
 def build_store(state: PhysicsState) -> ModbusSlaveContext:
     """
     Creates the pymodbus slave context (register datastore) with initial values.
@@ -300,7 +394,7 @@ def build_store(state: PhysicsState) -> ModbusSlaveContext:
     hr[HR_INLET_VALVE_SP] = 5000   # 50.00 %
     hr[HR_LEVEL_SP]       = _clamp(int(state.level_m * 100))
 
-    return ModbusSlaveContext(
+    return CountingSlaveContext(
         di=ModbusSequentialDataBlock(0, [0] * 256),  # discrete inputs — unused
         co=ModbusSequentialDataBlock(0, [0] * 256),  # coils — PLC writes control
         hr=ModbusSequentialDataBlock(0, list(hr)),   # holding registers
@@ -776,7 +870,245 @@ def update_generic(state: PhysicsState, dt: float) -> None:
 
 # ── Main simulation loop ───────────────────────────────────────────────────────
 
-async def physics_loop(store: ModbusSlaveContext) -> None:
+class EpisodeClock:
+    """
+    Shared clock and state window between the physics loop and the control API.
+
+    Implements a grant/drain handshake:
+
+      - The controller calls request(n). That sets a budget of n ticks, marks the
+        clock as not-drained, wakes the physics loop, and then waits for the
+        drained signal.
+      - The physics loop calls await_grant() before every tick, which blocks while
+        the budget is zero, and consume() after the tick's results are published.
+      - consume() decrements the budget and, when it reaches zero, sets the
+        drained event, which is what releases the controller's request().
+
+    The ordering matters: consume() is called only after the tick's state has been
+    written to both the Modbus datastore and this object, so by the time request()
+    returns, a subsequent /state read is guaranteed to observe the ticks that were
+    just granted. Without that ordering the controller could read a half-applied
+    tick and the whole point of lock-stepping would be lost.
+
+    A lock serialises concurrent /step callers so two controllers cannot interleave
+    budgets and each receive the other's completion.
+    """
+
+    def __init__(self) -> None:
+        self.tick = 0                              # ticks computed since start
+        self.store: "CountingSlaveContext | None" = None  # for external-IO counters
+        self.state: "PhysicsState | None" = None   # most recent published state
+        self.status = 0                            # most recent STATUS_WORD
+        self._budget = 0                           # ticks still owed to the caller
+        self._granted = asyncio.Event()            # set while budget > 0
+        self._drained = asyncio.Event()            # set while budget == 0
+        self._drained.set()                        # start idle, nothing owed
+        self._lock = asyncio.Lock()                # one stepper at a time
+
+    async def request(self, ticks: int) -> None:
+        """Grants `ticks` ticks and waits until all of them have been computed."""
+        async with self._lock:
+            self._budget = ticks
+            self._drained.clear()
+            self._granted.set()
+            await self._drained.wait()
+
+    async def await_grant(self) -> None:
+        """Blocks until at least one tick is owed. Returns immediately if one is."""
+        while self._budget <= 0:
+            self._granted.clear()
+            await self._granted.wait()
+
+    def consume(self) -> None:
+        """Marks one granted tick as computed, releasing the caller when none remain."""
+        self._budget -= 1
+        if self._budget <= 0:
+            self._drained.set()
+
+    def snapshot(self) -> dict:
+        """Serialisable view of the clock and the latest published process state."""
+        return {
+            "tick": self.tick,
+            "sim_time_s": round(self.state.sim_time_s, 6) if self.state else 0.0,
+            "status": self.status,
+            "process_type": PROCESS_TYPE,
+            "seed": SIM_SEED,
+            "dt_ms": SIM_DT_MS,
+            "state": {k: round(v, 6) for k, v in asdict(self.state).items()} if self.state else {},
+            "io": {
+                "pv_reads": self.store.pv_reads if self.store else 0,
+                "coil_writes": self.store.coil_writes if self.store else 0,
+            },
+        }
+
+
+# ── Control API ───────────────────────────────────────────────────────────────
+# A deliberately small HTTP/1.1 server built on asyncio streams rather than a web
+# framework. The image ships pymodbus and nothing else, and this endpoint exists
+# to be driven by a harness rather than browsed, so adding a dependency (and its
+# vulnerability surface) to serve three routes is not a good trade.
+
+def _http_response(code: int, payload: dict) -> bytes:
+    """Encodes a JSON body as a complete HTTP/1.1 response with Connection: close."""
+    body = json.dumps(payload).encode("utf-8")
+    reason = {200: "OK", 400: "Bad Request", 404: "Not Found",
+              405: "Method Not Allowed"}.get(code, "OK")
+    head = (
+        f"HTTP/1.1 {code} {reason}\r\n"
+        f"Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        f"Connection: close\r\n\r\n"
+    ).encode("ascii")
+    return head + body
+
+
+async def _read_request(reader: asyncio.StreamReader) -> "tuple[str, str, dict]":
+    """
+    Reads one HTTP request and returns (method, path, parsed JSON body).
+
+    Only what these three routes need is parsed: the request line, Content-Length,
+    and a JSON body when one is present. Anything else in the request is ignored.
+    """
+    request_line = await reader.readline()
+    if not request_line:
+        return "", "", {}
+    parts = request_line.decode("latin-1").split()
+    method, path = (parts[0], parts[1]) if len(parts) >= 2 else ("", "")
+
+    length = 0
+    while True:
+        line = await reader.readline()
+        if line in (b"\r\n", b"\n", b""):
+            break
+        name, _, value = line.decode("latin-1").partition(":")
+        if name.strip().lower() == "content-length":
+            try:
+                length = int(value.strip())
+            except ValueError:
+                length = 0
+
+    body = {}
+    if length > 0:
+        raw = await reader.readexactly(length)
+        try:
+            body = json.loads(raw.decode("utf-8"))
+            if not isinstance(body, dict):
+                body = {}
+        except (ValueError, UnicodeDecodeError):
+            body = {}
+    return method, path, body
+
+
+async def _settle_barrier(clock: EpisodeClock) -> dict:
+    """
+    Waits for the attached controller to complete one full scan against the
+    currently published state, so the coils the next tick reads are its response
+    to the state it actually saw.
+
+    Waits for a PV read first and only then for a coil write. Waiting for a write
+    alone would be satisfied by a write already in flight from a scan that ran
+    against the PREVIOUS state, which is the race this exists to close.
+
+    Returns a report rather than raising on timeout. A step that proceeded without
+    the controller settling is still a valid step, but the caller needs to know the
+    episode has a gap in its determinism guarantee — silently continuing would hide
+    exactly the problem this is here to prevent.
+    """
+    if not SIM_STEP_BARRIER:
+        return {"mode": "disabled", "satisfied": None, "waited_ms": 0}
+    if clock.store is None:
+        return {"mode": "unavailable", "satisfied": False, "waited_ms": 0}
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    deadline = started + SIM_BARRIER_TIMEOUT_MS / 1000.0
+    poll = 0.005  # 5 ms; the simulator is idle here, so this costs nothing
+
+    def waited_ms() -> int:
+        return int((loop.time() - started) * 1000)
+
+    # Phase 1 — the controller reads the state published by the previous step.
+    reads0 = clock.store.pv_reads
+    while clock.store.pv_reads <= reads0:
+        if loop.time() >= deadline:
+            return {"mode": "read", "satisfied": False, "waited_ms": waited_ms(),
+                    "detail": "no PV read observed before timeout"}
+        await asyncio.sleep(poll)
+
+    # Phase 2 — the controller writes the coils answering that read.
+    writes0 = clock.store.coil_writes
+    while clock.store.coil_writes <= writes0:
+        if loop.time() >= deadline:
+            return {"mode": "write", "satisfied": False, "waited_ms": waited_ms(),
+                    "detail": "PV read seen but no coil write before timeout"}
+        await asyncio.sleep(poll)
+
+    return {"mode": "scan", "satisfied": True, "waited_ms": waited_ms()}
+
+
+def _make_control_handler(clock: EpisodeClock):
+    """Builds the connection handler, closing over the shared EpisodeClock."""
+
+    async def handler(reader: asyncio.StreamReader,
+                      writer: asyncio.StreamWriter) -> None:
+        try:
+            method, path, body = await _read_request(reader)
+            path = path.split("?", 1)[0]
+
+            if path == "/health" and method == "GET":
+                resp = _http_response(200, {
+                    "ok": True,
+                    "mode": "stepped",
+                    "tick": clock.tick,
+                    "seed": SIM_SEED,
+                    "process_type": PROCESS_TYPE,
+                    "dt_ms": SIM_DT_MS,
+                    "barrier": SIM_STEP_BARRIER,
+                    "barrier_timeout_ms": SIM_BARRIER_TIMEOUT_MS,
+                })
+
+            elif path == "/state" and method == "GET":
+                resp = _http_response(200, clock.snapshot())
+
+            elif path == "/step" and method == "POST":
+                ticks = body.get("ticks", 1)
+                # Reject anything that is not a positive whole number of ticks.
+                # bool is excluded explicitly because it is a subclass of int and
+                # {"ticks": true} would otherwise silently mean one tick.
+                if isinstance(ticks, bool) or not isinstance(ticks, int) or ticks < 1:
+                    resp = _http_response(400, {
+                        "error": "ticks must be a positive integer",
+                        "got": repr(ticks),
+                    })
+                else:
+                    barrier = await _settle_barrier(clock)
+                    await clock.request(ticks)
+                    snap = clock.snapshot()
+                    snap["barrier"] = barrier
+                    resp = _http_response(200, snap)
+
+            elif path in ("/health", "/state", "/step"):
+                resp = _http_response(405, {"error": "method not allowed",
+                                            "path": path, "method": method})
+            else:
+                resp = _http_response(404, {"error": "not found", "path": path})
+
+            writer.write(resp)
+            await writer.drain()
+        except (asyncio.IncompleteReadError, ConnectionResetError):
+            pass  # client hung up mid-request; nothing useful to report
+        except Exception as exc:  # never let one bad request kill the listener
+            log.warning("Control API error: %s", exc)
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    return handler
+
+
+async def physics_loop(store: ModbusSlaveContext, clock: EpisodeClock) -> None:
     """
     Asynchronous physics loop: read controls → run physics → write sensor values.
 
@@ -810,7 +1142,8 @@ async def physics_loop(store: ModbusSlaveContext) -> None:
     log.info(
         "Physics loop started: process=%s  dt=%.3f s  pacing=%s  "
         "initial_volume=%.1f L  initial_level=%.2f m",
-        PROCESS_TYPE, dt, "real-time" if SIM_REALTIME else "fast-forward",
+        PROCESS_TYPE, dt,
+        "lock-step" if SIM_STEPPED else ("real-time" if SIM_REALTIME else "fast-forward"),
         state.volume_l, state.level_m,
     )
 
@@ -839,8 +1172,19 @@ async def physics_loop(store: ModbusSlaveContext) -> None:
     overruns  = 0  # ticks whose work did not finish before the next deadline
 
     tick = 0
+    # Publish the starting state so a controller can read /state before the
+    # first tick is granted and see the true initial conditions.
+    clock.store = store
+    clock.state = state
+    clock.status = _build_status(state, read_coils(store))
+
     while True:
-        if SIM_REALTIME:
+        if SIM_STEPPED:
+            # Lock-step: block until a controller grants a tick. No wall-clock
+            # term takes part in pacing, so the trajectory cannot depend on how
+            # fast this host happens to be.
+            await clock.await_grant()
+        elif SIM_REALTIME:
             # Deadline for the tick we are about to compute.
             delay = (t_start + (tick + 1) * dt) - loop.time()
             if delay > 0:
@@ -890,6 +1234,14 @@ async def physics_loop(store: ModbusSlaveContext) -> None:
 
             # Periodic status log: once every 30 ticks (~30 s at 1 Hz)
             tick += 1
+
+            # Publish this tick's results before releasing the stepper, so a
+            # /state read after /step returns always reflects the granted ticks.
+            clock.tick = tick
+            clock.state = state
+            clock.status = status
+            if SIM_STEPPED:
+                clock.consume()
             if tick % 30 == 0:
                 log.info(
                     "[%s] t=%.0f s | level=%.2f m | flow_in=%.1f L/min | "
@@ -940,9 +1292,24 @@ async def main() -> None:
     store   = build_store(initial_state)
     context = ModbusServerContext(slaves={UNIT_ID: store}, single=False)
 
+    clock = EpisodeClock()
+
     # Register physics loop BEFORE starting the server so the first tick runs
     # immediately — avoids a race where a PLC polls before any values are computed
-    asyncio.ensure_future(physics_loop(store))
+    asyncio.ensure_future(physics_loop(store, clock))
+
+    if SIM_STEPPED:
+        control = await asyncio.start_server(
+            _make_control_handler(clock), "0.0.0.0", SIM_CONTROL_PORT
+        )
+        log.info(
+            "Lock-step mode: physics advances only on POST /step — "
+            "control API on port %d (GET /health, GET /state, POST /step); "
+            "settle barrier %s",
+            SIM_CONTROL_PORT,
+            ("on, timeout %d ms" % SIM_BARRIER_TIMEOUT_MS) if SIM_STEP_BARRIER else "off",
+        )
+        asyncio.ensure_future(control.serve_forever())
 
     await StartAsyncTcpServer(context, address=("0.0.0.0", MODBUS_PORT))
 
