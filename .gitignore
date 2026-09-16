@@ -42,3 +42,11 @@ __pycache__/
 # the next launch (applied by scripts/apply-pending-update.mjs from `predev`).
 # Must stay untracked so it never trips the update handler's own dirty-tree guard.
 .otforge-pending-dep-update
+# Determinism-check scratch output — raw and trajectory logs written by the
+# SIM_SEED verification runs (see the process-sim episode API). Local evidence
+# for a one-off comparison between two seeded runs, never a build input.
+.simcmp/
+# Locally seeded copies of a tracked scenario — a normal .otflab with a
+# "simSeed" pinned in it, made by hand to re-run the same lab deterministically.
+# The tracked scenario stays authoritative; these variants are personal scratch.
+scenarios/*_seeded.otflab
