@@ -26,7 +26,8 @@ import { exec, spawn } from 'child_process'
 import { promisify } from 'util'
 import { writeFile, mkdir, rm } from 'fs/promises'
 import { join } from 'path'
-import type { ContainerStatus } from '@otforge/schema'
+import type { ContainerStatus, SuricataRuleCheckResult } from '@otforge/schema'
+import { SURICATA_IMAGE, RULE_TEST_SCRIPT, countRules, interpretRuleTest } from './suricata-rules'
 
 const execAsync = promisify(exec)
 
@@ -566,6 +567,86 @@ export class DockerClient {
    */
   composeFilePath(projectName: string): string {
     return join(this.workDir, projectName, 'docker-compose.yml')
+  }
+
+  /**
+   * Checks custom Suricata rules with the real `suricata -T`, in a throwaway container
+   * from the sensor image. Used by the IDS panel's Save button; see suricata-rules.ts.
+   *
+   * The container:
+   *   - `--pull never`: never starts a large download from a Save click. If the image
+   *     isn't local yet, the result is 'unavailable' and the sensor's own start-up
+   *     check still covers the rules.
+   *   - `--network none`: the test needs no network.
+   *   - `--rm`: nothing is left behind.
+   * The rules go in on stdin, so no quoting or temp files are involved.
+   *
+   * @param rulesText - Custom rules exactly as they will be saved (already trimmed).
+   * @returns Never throws; Docker problems come back as status 'unavailable'.
+   */
+  validateSuricataRules(rulesText: string): Promise<SuricataRuleCheckResult> {
+    const ruleCount = countRules(rulesText)
+    const unavailable = (message: string): SuricataRuleCheckResult => ({
+      status: 'unavailable',
+      ruleCount,
+      errors: [],
+      message
+    })
+
+    return new Promise(resolve => {
+      const proc = spawn(
+        'docker',
+        [
+          'run',
+          '--rm',
+          '-i',
+          '--pull',
+          'never',
+          '--network',
+          'none',
+          '--entrypoint',
+          'sh',
+          SURICATA_IMAGE,
+          '-c',
+          RULE_TEST_SCRIPT
+        ],
+        { env: buildEnv(), stdio: 'pipe' }
+      )
+
+      let output = ''
+      proc.stdout?.on('data', chunk => (output += chunk.toString()))
+      proc.stderr?.on('data', chunk => (output += chunk.toString()))
+
+      // The test itself takes ~0.1 s; container start adds ~1 s. 30 s means something
+      // is wrong with Docker, not with the rules.
+      const timer = setTimeout(() => {
+        proc.kill()
+        resolve(unavailable('The rule check timed out. Docker may be busy.'))
+      }, 30_000)
+
+      proc.on('error', () => {
+        clearTimeout(timer)
+        resolve(unavailable('Docker is not available, so the rules could not be checked now.'))
+      })
+
+      proc.on('close', code => {
+        clearTimeout(timer)
+        if (code === 0) {
+          resolve(interpretRuleTest(output, rulesText))
+        } else if (/No such image|Unable to find image/i.test(output)) {
+          resolve(
+            unavailable(
+              'The Suricata sensor image is not downloaded yet (it downloads the first time a simulation with an IDS starts), so the rules could not be checked now.'
+            )
+          )
+        } else {
+          resolve(unavailable('Docker is not running, so the rules could not be checked now.'))
+        }
+      })
+
+      proc.stdin?.write(rulesText.endsWith('\n') ? rulesText : `${rulesText}\n`)
+      proc.stdin?.end()
+    })
   }
 }
 

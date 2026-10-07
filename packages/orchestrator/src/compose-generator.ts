@@ -31,6 +31,7 @@
 import yaml from 'js-yaml'
 import type { OTForgeScenario, DeviceCategory, NetworkZone } from '@otforge/schema'
 import { ZONE_DEFAULTS } from './network-config'
+import { SURICATA_IMAGE } from './suricata-rules'
 import {
   buildAutoPlcProgram,
   buildBatchProgram,
@@ -109,7 +110,7 @@ const DEVICE_IMAGES: Record<DeviceCategory, string> = {
   'engineering-workstation': 'ghcr.io/iburres/otforge-workstation:latest',
   // ── Plant DMZ (Level 3.5) ───────────────────────────────────────────────────
   firewall: 'ghcr.io/iburres/otforge-firewall:latest',
-  'ids-ips': 'ghcr.io/iburres/otforge-suricata:latest',
+  'ids-ips': SURICATA_IMAGE,
   switch: 'ghcr.io/iburres/otforge-switch:latest',
   router: 'ghcr.io/iburres/otforge-router:latest',
   // STUB: Jump server — OpenSSH on Alpine until otforge-jump-server is built.
@@ -1416,7 +1417,7 @@ ${deviceBlocks}
 
   volumes[`${projectName}-suricata-logs`] = {}
   services['suricata'] = {
-    image: 'ghcr.io/iburres/otforge-suricata:latest',
+    image: SURICATA_IMAGE,
     pull_policy: 'if_not_present',
     container_name: `${projectName}-suricata`,
     restart: 'unless-stopped',
