@@ -45,7 +45,8 @@ import type {
   PackInstallResult,
   PackListResult,
   PackUninstallResult,
-  ACLRule
+  ACLRule,
+  SuricataRuleCheckResult
 } from '@otforge/schema'
 
 /**
@@ -197,6 +198,19 @@ const api = {
       rules: ACLRule[]
       defaultPolicy: string
     }): Promise<{ ok: boolean; error?: string }> => ipcRenderer.invoke('firewall:reload', args)
+  },
+
+  // ── IDS (Suricata) ────────────────────────────────────────────────────────────
+  ids: {
+    /**
+     * Checks custom Suricata rules with the real `suricata -T` in a throwaway sensor
+     * container. Called by the IDS panel's Save button. Never rejects; Docker problems
+     * come back as status 'unavailable'.
+     *
+     * @param rules - Custom rules text exactly as it will be saved (trimmed).
+     */
+    validateRules: (rules: string): Promise<SuricataRuleCheckResult> =>
+      ipcRenderer.invoke('ids:validateRules', { rules })
   },
 
   // ── Attack terminal ───────────────────────────────────────────────────────────

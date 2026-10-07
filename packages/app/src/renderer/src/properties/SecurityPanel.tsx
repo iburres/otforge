@@ -29,8 +29,8 @@
  *   → App.tsx applies updater to scenario.security and re-renders
  */
 
-import { useState, useCallback } from 'react'
-import type { SecurityLayer, ACLRule, NetworkZone } from '@otforge/schema'
+import { useState, useCallback, useRef } from 'react'
+import type { SecurityLayer, ACLRule, NetworkZone, SuricataRuleCheckResult } from '@otforge/schema'
 
 /** Props shared by both security sub-panels. */
 interface SecurityPanelProps {
@@ -452,18 +452,66 @@ export function IDSPanel({ security, onSecurityChange }: SecurityPanelProps) {
   }, [sidText, onSecurityChange])
 
   /**
-   * Commit the custom rules draft to scenario state.
+   * Result of the last Save-time rule check, or null before the first check / after
+   * the rules were cleared. Shown under the textarea.
+   */
+  const [ruleCheck, setRuleCheck] = useState<SuricataRuleCheckResult | null>(null)
+
+  /** True while a rule check is running (Save button shows "Checking…"). */
+  const [checkingRules, setCheckingRules] = useState(false)
+
+  /**
+   * Increments on every Save. A check result is applied only if no newer Save started
+   * while it ran, so a slow earlier check can't overwrite a newer one's result.
+   */
+  const checkSeq = useRef(0)
+
+  /**
+   * Commit the custom rules draft to scenario state, then check it with Suricata.
    * Stores the raw rule text; compose-generator base64-encodes it when building
    * the IDS_CUSTOM_RULES_B64 env var for the Suricata container.
    * Empty string is stored as undefined so serialized scenarios stay clean.
+   *
+   * Saving never waits on the check and never depends on it: rules are saved even when
+   * Docker is unavailable, and the sensor re-checks them at start-up anyway. The check
+   * exists so a mistake shows up here, next to the rule, instead of as "no alerts".
+   *
+   * The draft is replaced with the trimmed text so the line numbers Suricata reports
+   * (counted in the saved text) match the lines in the textarea.
    */
-  const commitCustomRules = useCallback(() => {
+  const commitCustomRules = useCallback(async () => {
     const trimmed = customRulesDraft.trim()
+    setCustomRulesDraft(trimmed)
     onSecurityChange(s => ({
       ...s,
       ids: { ...s.ids, customRules: trimmed.length > 0 ? trimmed : undefined }
     }))
+
+    const seq = ++checkSeq.current
+    if (trimmed.length === 0) {
+      setRuleCheck(null)
+      setCheckingRules(false)
+      return
+    }
+    setCheckingRules(true)
+    let result: SuricataRuleCheckResult
+    try {
+      result = await window.electronAPI.ids.validateRules(trimmed)
+    } catch {
+      result = {
+        status: 'unavailable',
+        ruleCount: 0,
+        errors: [],
+        message: 'The rule check could not run.'
+      }
+    }
+    if (seq !== checkSeq.current) return
+    setRuleCheck(result)
+    setCheckingRules(false)
   }, [customRulesDraft, onSecurityChange])
+
+  /** Lines of the saved rules, for quoting a rejected rule back to the student. */
+  const savedRuleLines = (security.ids.customRules ?? '').split('\n')
 
   return (
     <>
@@ -525,10 +573,12 @@ export function IDSPanel({ security, onSecurityChange }: SecurityPanelProps) {
        * Each line is a standard Suricata rule in the format:
        *   action proto src_ip src_port -> dst_ip dst_port (options)
        *
-       * Example — alert on any Modbus write to coils (FC 05):
-       *   alert tcp any any -> $OT_NETWORK 502 (msg:"Modbus Write Single Coil"; \
-       *     content:"|00 00|"; offset:2; depth:2; content:"|00 05|"; \
-       *     sid:9000001; rev:1;)
+       * Example — alert on any Modbus Write Single Coil (function code 05, the byte
+       * right after the 7-byte MBAP header):
+       *   alert tcp any any -> $HOME_NET 502 (msg:"Modbus Write Single Coil"; content:"|05|"; offset:7; depth:1; sid:9100101; rev:1;)
+       * Use only variables defined in containers/suricata/suricata.yaml ($HOME_NET,
+       * $EXTERNAL_NET, $MODBUS_PORTS, ...); an undefined one makes Suricata reject the rule.
+       * Save also checks the rules with the real Suricata (see commitCustomRules).
        *
        * Rules are saved to the scenario file and injected as IDS_CUSTOM_RULES_B64
        * at simulation start. Suricata loads them from /etc/suricata/rules/custom.rules.
@@ -553,7 +603,7 @@ export function IDSPanel({ security, onSecurityChange }: SecurityPanelProps) {
           value={customRulesDraft}
           onChange={e => setCustomRulesDraft(e.target.value)}
           placeholder={
-            'alert tcp any any -> $OT_NETWORK 502 (msg:"Modbus coil write"; content:"|00 05|"; sid:9000001; rev:1;)'
+            'alert tcp any any -> $HOME_NET 502 (msg:"Modbus Write Single Coil"; content:"|05|"; offset:7; depth:1; sid:9100101; rev:1;)'
           }
           spellCheck={false}
           aria-label="Custom Suricata rules"
@@ -561,16 +611,61 @@ export function IDSPanel({ security, onSecurityChange }: SecurityPanelProps) {
         />
         <div className="ids-custom-rules-footer">
           <p className="ids-sids-hint">
-            Standard Suricata rule syntax. Use SIDs ≥ 9000000 to avoid conflicts with Emerging
-            Threats rules. Restart simulation to apply.
+            Standard Suricata rule syntax, one rule per line. Use SIDs ≥ 9100000: OTForge&apos;s
+            bundled rules use 9000001–9000050 and Emerging Threats uses 2000000–2999999. Restart
+            simulation to apply.
           </p>
           <button
             className="btn btn-sm btn-secondary ids-custom-rules-save"
             onClick={commitCustomRules}
+            disabled={checkingRules}
           >
-            Save Rules
+            {checkingRules ? 'Checking…' : 'Save Rules'}
           </button>
         </div>
+
+        {/* ── Save-time rule check result ─────────────────────────────────── */}
+        {/* Suricata's own verdict on the saved rules. A rejected rule is skipped by */}
+        {/* the sensor (it keeps running on the rest), so it would never alert.      */}
+        {ruleCheck && !checkingRules && (
+          <div className={`ids-rule-check ids-rule-check-${ruleCheck.status}`} role="status">
+            {ruleCheck.status === 'valid' && (
+              <p className="ids-rule-check-title">
+                ✓ Suricata accepted{' '}
+                {ruleCheck.ruleCount === 1 ? 'the rule' : `all ${ruleCheck.ruleCount} rules`}.
+              </p>
+            )}
+
+            {ruleCheck.status === 'invalid' && (
+              <>
+                <p className="ids-rule-check-title">
+                  {ruleCheck.errors.length > 0
+                    ? `✗ ${ruleCheck.errors.length} of ${ruleCheck.ruleCount} rule${ruleCheck.ruleCount === 1 ? '' : 's'} will NOT load. The sensor skips ${ruleCheck.errors.length === 1 ? 'it' : 'them'}, so ${ruleCheck.errors.length === 1 ? 'it' : 'they'} can never alert:`
+                    : '✗ Suricata rejected these rules:'}
+                </p>
+                {ruleCheck.errors.map(err => (
+                  <div key={err.line} className="ids-rule-check-error">
+                    <div className="ids-rule-check-reason">
+                      Line {err.line}: {err.reason}
+                    </div>
+                    {savedRuleLines[err.line - 1] !== undefined && (
+                      <code className="ids-rule-check-rule">{savedRuleLines[err.line - 1]}</code>
+                    )}
+                    {err.hint && <div className="ids-rule-check-hint">{err.hint}</div>}
+                  </div>
+                ))}
+                {ruleCheck.message && <p className="ids-rule-check-reason">{ruleCheck.message}</p>}
+              </>
+            )}
+
+            {ruleCheck.status === 'unavailable' && (
+              <p className="ids-rule-check-title">
+                Saved, but not checked: {ruleCheck.message} The sensor checks them again when the
+                simulation starts.
+              </p>
+            )}
+          </div>
+        )}
       </section>
     </>
   )

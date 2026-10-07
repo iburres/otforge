@@ -2535,6 +2535,61 @@ code.prop-value {
   line-height: 1.4;
 }
 
+/*
+ * Save-time custom rule check (IDSPanel). Left border carries the verdict color:
+ * green = Suricata accepted every rule, red = some rules will not load,
+ * muted = the check couldn't run (Docker stopped / sensor image not downloaded).
+ */
+.ids-rule-check {
+  margin-top: 0.5rem;
+  padding: 0.4rem 0.5rem;
+  border-left: 3px solid var(--border);
+  background: var(--bg-input);
+  border-radius: 3px;
+  font-size: 0.68rem;
+  line-height: 1.4;
+}
+.ids-rule-check-valid {
+  border-left-color: var(--accent-green);
+}
+.ids-rule-check-invalid {
+  border-left-color: var(--accent-red);
+}
+.ids-rule-check-title {
+  margin: 0;
+  color: var(--text-primary);
+}
+.ids-rule-check-valid .ids-rule-check-title {
+  color: var(--accent-green);
+}
+.ids-rule-check-invalid .ids-rule-check-title {
+  color: var(--accent-red);
+}
+.ids-rule-check-unavailable .ids-rule-check-title {
+  color: var(--text-muted);
+}
+.ids-rule-check-error {
+  margin-top: 0.4rem;
+}
+.ids-rule-check-reason {
+  margin: 0;
+  color: var(--text-primary);
+}
+/* The rejected rule quoted back; wraps so long rules stay inside the panel. */
+.ids-rule-check-rule {
+  display: block;
+  margin-top: 0.15rem;
+  font-family: 'Cascadia Code', 'Fira Code', monospace;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.ids-rule-check-hint {
+  margin-top: 0.15rem;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
 /* ── Layer tab bar (Purdue model layer navigation) ────────────────────────────── */
 
 /*

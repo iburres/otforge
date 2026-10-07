@@ -54,6 +54,38 @@ export interface SimulationStopResult {
 }
 
 /**
+ * One custom Suricata rule that `suricata -T` refused to load, returned by
+ * ids:validateRules.
+ */
+export interface SuricataRuleError {
+  /** 1-based line in the saved custom rules text (the first line of a `\`-continued rule). */
+  line: number
+  /** Suricata's own reason, e.g. "unknown rule keyword 'conten'." */
+  reason: string
+  /** Plain-language hint for common student mistakes; absent when there isn't one. */
+  hint?: string
+}
+
+/**
+ * Result of checking custom Suricata rules against the real sensor image, returned by
+ * ids:validateRules.
+ *
+ * status:
+ *   - 'valid'       — every rule loaded.
+ *   - 'invalid'     — at least one rule failed; see errors (and message for a failure
+ *                     Suricata did not tie to a specific line).
+ *   - 'unavailable' — the check could not run (Docker stopped, sensor image not yet
+ *                     downloaded). Says nothing about the rules; message explains why.
+ */
+export interface SuricataRuleCheckResult {
+  status: 'valid' | 'invalid' | 'unavailable'
+  /** Number of rule statements found in the text (lines starting with an action keyword). */
+  ruleCount: number
+  errors: SuricataRuleError[]
+  message?: string
+}
+
+/**
  * Lightweight descriptor of a saved student session, returned by session:list.
  * Excludes the full scenario payload so the picker stays cheap to render.
  */

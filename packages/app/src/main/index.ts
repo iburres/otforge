@@ -72,7 +72,7 @@ import {
   getOtZoneTopology
 } from '@otforge/orchestrator'
 import type { OtZoneDevice, OtZoneTopology } from '@otforge/orchestrator'
-import type { NetworkZone, ACLRule } from '@otforge/schema'
+import type { NetworkZone, ACLRule, SuricataRuleCheckResult } from '@otforge/schema'
 import { initDb, saveActiveScenario, loadActiveScenario, clearActiveScenario } from './db'
 import { saveSession, loadSession, listSessions, sessionDir } from './sessions'
 import { parsePlcFile } from './plc-import'
@@ -1385,6 +1385,22 @@ function registerIPCHandlers(): void {
         proc.on('error', err => resolve({ ok: false, error: err.message }))
       })
     }
+  )
+
+  // ── IDS custom rule check ─────────────────────────────────────────────────────
+
+  /**
+   * Checks custom Suricata rules when the student clicks Save in the IDS panel, by
+   * running the real `suricata -T` in a throwaway container from the sensor image.
+   * Works with or without a running simulation. See suricata-rules.ts for why.
+   *
+   * @param rules - Custom rules text exactly as it will be saved (trimmed), so the
+   *                line numbers in the result match what the panel shows.
+   */
+  ipcMain.handle(
+    'ids:validateRules',
+    (_e, { rules }: { rules: string }): Promise<SuricataRuleCheckResult> =>
+      dockerClient.validateSuricataRules(rules)
   )
 
   // ── Monitoring — Loki log query proxy (Phase 6) ───────────────────────────────
