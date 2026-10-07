@@ -414,26 +414,27 @@ export class DockerClient {
     try {
       // codeql[js/shell-command-constructed-from-input] -- projectName is sanitized to [a-z0-9-] by toProjectName()
       const { stdout } = await run(`docker compose -p ${projectName} ps --format json`)
-      if (!stdout.trim()) return []
+      const statuses = parseComposePs(stdout, projectName)
+      if (statuses.length === 0) return statuses
 
-      // Docker Compose ps --format json outputs one JSON object per line (not a JSON array)
-      const statuses: ContainerStatus[] = stdout
-        .trim()
-        .split('\n')
-        .filter(line => line.trim())
-        .map(line => {
-          const obj = JSON.parse(line) as { Name: string; State: string; Health: string }
-          const health = mapDockerHealth(obj.Health)
-          // Strip the project name prefix Docker adds to container names (e.g., "otforge-demo-plc-1" → "plc-1")
-          const entry: ContainerStatus = {
-            nodeId: obj.Name.replace(`${projectName}-`, ''),
-            containerId: obj.Name,
-            status: mapDockerState(obj.State)
-          }
-          // healthCheck is an optional field — only set it when Docker reports a health state
-          if (health !== undefined) entry.healthCheck = health
-          return entry
-        })
+      // A crash-looping container flips between "running" and "restarting", so a 3 s
+      // poll can catch either; RestartCount is the reliable signal. compose ps doesn't
+      // report it, so read it for every container with one `docker inspect` call.
+      // Failure here must not lose the statuses, so it's caught separately.
+      try {
+        const names = statuses.map(s => s.containerId).filter((n): n is string => !!n)
+        // codeql[js/shell-command-constructed-from-input] -- container names come from docker compose ps for a sanitized project
+        const inspect = await run(
+          `docker inspect --format "{{.Name}}|{{.RestartCount}}" ${names.join(' ')}`
+        )
+        const counts = parseRestartCounts(inspect.stdout)
+        for (const s of statuses) {
+          const n = s.containerId ? counts.get(s.containerId) : undefined
+          if (n !== undefined) s.restartCount = n
+        }
+      } catch {
+        // A container can vanish between ps and inspect (e.g. during stop); skip counts.
+      }
       return statuses
     } catch {
       // Compose project not found or docker not running — return empty rather than throwing
@@ -670,9 +671,66 @@ function mapDockerState(state: string): ContainerStatus['status'] {
     case 'created':
     case 'starting':
       return 'starting'
+    // Between restart attempts after a crash. This used to fall through to 'stopped',
+    // which hid a crash-looping container (e.g. Suricata killed by a bad custom rule).
+    case 'restarting':
+      return 'restarting'
     default:
       return 'stopped'
   }
+}
+
+/**
+ * Parses `docker compose ps --format json` output into ContainerStatus entries.
+ *
+ * Compose prints one JSON object per line (not a JSON array). Its ExitCode field reads
+ * 0 even while a container is crash-looping (verified on Docker 28), so the real exit
+ * code comes from the Status text instead: "Restarting (1) 5 seconds ago".
+ *
+ * @param stdout      - Raw `docker compose ps --format json` output.
+ * @param projectName - Compose project name; its "<project>-" prefix is stripped from
+ *                      container names to get the node id (e.g. "lab-suricata" → "suricata").
+ */
+export function parseComposePs(stdout: string, projectName: string): ContainerStatus[] {
+  return stdout
+    .trim()
+    .split('\n')
+    .filter(line => line.trim())
+    .map(line => {
+      const obj = JSON.parse(line) as {
+        Name: string
+        State: string
+        Health?: string
+        Status?: string
+      }
+      const entry: ContainerStatus = {
+        nodeId: obj.Name.replace(`${projectName}-`, ''),
+        containerId: obj.Name,
+        status: mapDockerState(obj.State)
+      }
+      // healthCheck is an optional field — only set it when Docker reports a health state
+      const health = mapDockerHealth(obj.Health ?? '')
+      if (health !== undefined) entry.healthCheck = health
+      const exit = /^Restarting \((\d+)\)/.exec(obj.Status ?? '')
+      if (exit) entry.lastExitCode = parseInt(exit[1]!, 10)
+      return entry
+    })
+}
+
+/**
+ * Parses `docker inspect --format "{{.Name}}|{{.RestartCount}}"` output into a map of
+ * container name → restart count. Inspect prefixes names with "/", which is stripped
+ * so keys match the names `docker compose ps` reports.
+ *
+ * @param stdout - Raw inspect output, one "name|count" line per container.
+ */
+export function parseRestartCounts(stdout: string): Map<string, number> {
+  const counts = new Map<string, number>()
+  for (const line of stdout.split('\n')) {
+    const m = /^\/?([^|]+)\|(\d+)\s*$/.exec(line.trim())
+    if (m) counts.set(m[1]!, parseInt(m[2]!, 10))
+  }
+  return counts
 }
 
 /**

@@ -269,11 +269,49 @@ function CanvasViewHint({ simRunning }: { simRunning?: boolean }) {
 // ── Status bar ─────────────────────────────────────────────────────────────────
 
 /**
+ * True when a container keeps dying and Docker keeps restarting it.
+ *
+ * Checks restartCount as well as status: a crash-looping container flips between
+ * 'running' (while it boots) and 'restarting' (after it dies), so a poll often
+ * catches it looking healthy. Any restart counts, because nothing in a simulation is
+ * expected to exit on its own while it runs.
+ */
+function isCrashLooping(c: ContainerStatus): boolean {
+  return c.status === 'restarting' || (c.restartCount ?? 0) > 0
+}
+
+/** Sort key for status pills: crash-looping first, then errors, then everything else. */
+function pillRank(c: ContainerStatus): number {
+  if (isCrashLooping(c)) return 0
+  if (c.status === 'error') return 1
+  return 2
+}
+
+/**
+ * Hover text for a crash-looping container: what's happening, and, for the IDS
+ * sensor, the usual cause. That case cost a student days in July 2026 because the
+ * only symptom was "no alerts".
+ */
+function crashTooltip(c: ContainerStatus): string {
+  const times = c.restartCount
+    ? ` Docker has restarted it ${c.restartCount} time${c.restartCount === 1 ? '' : 's'}`
+    : ''
+  const exit = c.lastExitCode !== undefined ? ` (last exit code ${c.lastExitCode})` : ''
+  const base = `${c.nodeId} keeps crashing.${times}${exit}${times ? '.' : ''} It is not working, even when it briefly shows as running.`
+  if (c.nodeId === 'suricata') {
+    return `${base}\nThe usual cause is a custom rule Suricata can't parse: check Custom Rules in the IDS/IPS properties, then restart the simulation.`
+  }
+  return base
+}
+
+/**
  * Bottom status bar showing Docker status, container health pills, and the
  * Delete Scenario button (Author mode only, idle only — bottom-right corner).
  *
  * Container pills are shown for up to 6 containers with color-coded borders:
- *   green border = running, red border = error, gray border = other.
+ *   green border = running, red border = error or crash-looping, gray border = other.
+ * Crash-looping containers sort first (so the "+N" overflow can't hide them), get a
+ * ↻<restart count> badge, and are named on the left of the bar.
  * When more than 6 containers are running, a "+N more" chip is shown.
  *
  * @param docker            - Docker status for the left section.
@@ -297,8 +335,13 @@ function StatusBar({
   /** Handler for the Delete Scenario button. */
   onDelete?: () => void
 }) {
-  const running = containerStatuses.filter(c => c.status === 'running').length
+  // A crash-looping container isn't doing its job even in the moments it shows
+  // "running", so it doesn't count as running here.
+  const crashing = containerStatuses.filter(isCrashLooping)
+  const running = containerStatuses.filter(c => c.status === 'running' && !isCrashLooping(c)).length
   const total = containerStatuses.length
+  // Problem containers first, so they can never be hidden behind the "+N" overflow chip.
+  const pills = [...containerStatuses].sort((a, b) => pillRank(a) - pillRank(b))
 
   return (
     <footer className="status-bar">
@@ -314,26 +357,41 @@ function StatusBar({
             </span>
           </>
         )}
+        {/* Name every crash-looping container: a dead sensor used to be invisible */}
+        {simStatus === 'running' && crashing.length > 0 && (
+          <>
+            <span className="status-sep">·</span>
+            <span className="status-bar-crashing" title={crashing.map(crashTooltip).join('\n\n')}>
+              ⚠ {crashing.map(c => c.nodeId).join(', ')} keep
+              {crashing.length === 1 ? 's' : ''} crashing
+            </span>
+          </>
+        )}
       </div>
       <div className="status-bar-right">
         <div className="status-bar-pills">
           {/* Show up to 6 container health pills with color-coded borders */}
-          {containerStatuses.slice(0, 6).map(c => (
-            <span
-              key={c.nodeId}
-              className="container-pill"
-              title={`${c.nodeId}: ${c.status}`}
-              style={{
-                borderColor:
-                  c.status === 'running' ? '#3fb950' : c.status === 'error' ? '#f85149' : '#484f58'
-              }}
-            >
+          {pills.slice(0, 6).map(c => {
+            const bad = c.status === 'error' || isCrashLooping(c)
+            return (
               <span
-                className={`status-dot xs ${c.status === 'running' ? 'ok' : c.status === 'error' ? 'error' : 'checking'}`}
-              />
-              {c.nodeId}
-            </span>
-          ))}
+                key={c.nodeId}
+                className="container-pill"
+                title={isCrashLooping(c) ? crashTooltip(c) : `${c.nodeId}: ${c.status}`}
+                style={{
+                  borderColor: bad ? '#f85149' : c.status === 'running' ? '#3fb950' : '#484f58'
+                }}
+              >
+                <span
+                  className={`status-dot xs ${bad ? 'error' : c.status === 'running' ? 'ok' : 'checking'}`}
+                />
+                {c.nodeId}
+                {isCrashLooping(c) && (
+                  <span className="container-pill-restarts">↻{c.restartCount ?? ''}</span>
+                )}
+              </span>
+            )
+          })}
           {/* Overflow count when more than 6 containers are present */}
           {containerStatuses.length > 6 && (
             <span className="container-pill-more">+{containerStatuses.length - 6}</span>
