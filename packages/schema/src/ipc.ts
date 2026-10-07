@@ -85,8 +85,21 @@ export interface SessionLoadResult {
 export interface ContainerStatus {
   nodeId: string
   containerId?: string
-  status: 'running' | 'stopped' | 'error' | 'starting'
+  /**
+   * 'restarting' = Docker is between restart attempts (restart policy after a crash).
+   * A crash-looping container alternates between 'running' and 'restarting', so on
+   * its own this field can't be trusted to show the problem. Use restartCount too.
+   */
+  status: 'running' | 'stopped' | 'error' | 'starting' | 'restarting'
   healthCheck?: 'healthy' | 'unhealthy' | 'starting'
+  /**
+   * How many times Docker has restarted this container since it was created (from
+   * `docker inspect`). Anything above 0 means it died on its own at least once.
+   * Absent when the count couldn't be read.
+   */
+  restartCount?: number
+  /** Exit code of the last crash, when Docker reports it (only while 'restarting'). */
+  lastExitCode?: number
 }
 
 export interface LicenseValidationResult {

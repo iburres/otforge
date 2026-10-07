@@ -1607,6 +1607,22 @@ code.prop-value {
   color: var(--text-muted);
 }
 
+/* ↻N restart-count badge on a crash-looping container's pill. */
+.container-pill-restarts {
+  color: var(--accent-red);
+  font-weight: 600;
+}
+
+/*
+ * "⚠ suricata keeps crashing" on the left of the status bar. Hover shows the
+ * restart count, exit code, and (for the IDS sensor) the usual cause.
+ */
+.status-bar-crashing {
+  color: var(--accent-red);
+  font-weight: 600;
+  cursor: help;
+}
+
 /* ── PLC IDE launch button (in the properties panel sidebar) ──────────────────── */
 
 /*
