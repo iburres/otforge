@@ -1,5 +1,24 @@
 FROM jasonish/suricata:latest
 
+# Apply AlmaLinux security updates on top of the upstream image. Until 2026-10-07
+# this image had no package layer of its own, so a CVE fixed in the Alma repos stayed
+# in the image until jasonish/suricata itself was rebuilt, and the Trivy gate in
+# docker.yml went red with nothing to rebuild.
+#
+# SECURITY_REFRESH busts this layer's build cache so a rebuild re-runs the upgrade
+# against the *current* Alma repos instead of reusing an old cached layer (same
+# pattern as containers/zeek and containers/workstation). Bump the date whenever a
+# newly published security update needs to be pulled.
+# 2026-10-07: curl/libcurl-minimal (CVE-2026-8458, -8927), expat (CVE-2026-66046,
+# -93990), gdb-gdbserver (CVE-2026-13732), libevent (CVE-2026-63379), libpcap
+# (CVE-2026-0799), libxml2 (CVE-2026-74860): 22 HIGH findings, all with fixed
+# el9_8 packages, flagged by the Trivy scan after PR #86 republished this image.
+ARG SECURITY_REFRESH=2026-10-07
+RUN echo "security-refresh: ${SECURITY_REFRESH}" \
+    && dnf -y upgrade --refresh \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
 # CVE-2026-58016 (glib2, HIGH) is suppressed in the root .trivyignore — it's
 # baked into this upstream base image (no apt/dnf layer of our own to patch
 # it with) and isn't fixed in jasonish/suricata:latest yet as of 2026-07-21.
