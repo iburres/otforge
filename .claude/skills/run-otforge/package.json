@@ -1,0 +1,9 @@
+{
+  "name": "otforge-run-driver",
+  "private": true,
+  "description": "Agent driver for the OTForge Electron app; see SKILL.md",
+  "type": "module",
+  "dependencies": {
+    "playwright-core": "1.48.2"
+  }
+}
