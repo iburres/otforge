@@ -50,3 +50,12 @@ __pycache__/
 # "simSeed" pinned in it, made by hand to re-run the same lab deterministically.
 # The tracked scenario stays authoritative; these variants are personal scratch.
 scenarios/*_seeded.otflab
+# Firmware analysis (packages/fw-analyzer) — SENSITIVE-DATA GUARD.
+# firmware-in/ is the drop-zone for firmware blobs and findings-out/ holds
+# extracted filesystems, SBOMs and draft findings. Vendor firmware can be
+# licensed/NDA-bound and pre-disclosure findings are embargoed, so neither
+# directory may ever be committed from this public repo — not even by an
+# accidental `git add -A`. Confirmed findings live in the separate PRIVATE
+# OTForge-disclosures repo. Leading slash = repo root only.
+/firmware-in/
+/findings-out/

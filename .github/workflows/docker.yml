@@ -67,6 +67,10 @@ jobs:
           # Kerberos (88), SMB (445), Enterprise Zone.
           - image: otforge-dc
             context: containers/dc
+          # Firmware unpack toolchain (unblob + sasquatch/jefferson/7z) used by
+          # packages/fw-analyzer. Offline analysis tool, not a lab device.
+          - image: otforge-fw-analyzer
+            context: containers/fw-analyzer
           - image: otforge-firewall
             context: containers/firewall
           - image: otforge-switch
